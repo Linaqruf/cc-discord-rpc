@@ -217,7 +217,10 @@ def write_refcount(count: int):
         except OSError:
             pass
     else:
-        REFCOUNT_FILE.write_text(str(count), encoding="utf-8")
+        try:
+            REFCOUNT_FILE.write_text(str(count), encoding="utf-8")
+        except OSError as e:
+            log(f"Warning: Could not write refcount: {e}")
 
 
 def get_model_from_jsonl() -> str:
@@ -283,6 +286,7 @@ def get_session_tokens_and_cost(session_id: str = "") -> dict:
         "cache_read": 0,
         "cache_write": 0,
         "cost": 0.0,
+        "simple_cost": 0.0,
     }
     if not PROJECTS_DIR.exists():
         return empty_result
