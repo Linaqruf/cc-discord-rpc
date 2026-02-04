@@ -21,6 +21,7 @@ try:
     YAML_AVAILABLE = True
 except ImportError:
     YAML_AVAILABLE = False
+    _yaml_warning_logged = False
 
 # Discord Application ID
 DISCORD_APP_ID = "1330919293709324449"
@@ -119,6 +120,9 @@ DEFAULT_CONFIG = {
 }
 CONFIG_RELOAD_INTERVAL = 30  # Reload config every 30 seconds
 
+# Discord connection retry limit (12 retries * 5 seconds = 1 minute before giving up)
+DISCORD_CONNECT_MAX_RETRIES = 12
+
 # Tools that operate on files (for filename display)
 FILE_TOOLS = {"Edit", "Write", "Read", "NotebookEdit", "NotebookRead"}
 
@@ -151,13 +155,23 @@ def load_config() -> dict:
 
     Returns merged config with defaults for any missing keys.
     """
+    global _yaml_warning_logged
+
     config = DEFAULT_CONFIG.copy()
     config["display"] = DEFAULT_CONFIG["display"].copy()
 
+    plugin_root = get_plugin_root()
+
+    # Warn if config.yaml exists but PyYAML is not installed
     if not YAML_AVAILABLE:
+        if plugin_root:
+            config_path = plugin_root / ".claude-plugin" / CONFIG_FILE_NAME
+            if config_path.exists() and not _yaml_warning_logged:
+                log(f"Warning: PyYAML not installed - config.yaml is being IGNORED. Install with: pip install pyyaml")
+                _yaml_warning_logged = True
         return config
 
-    plugin_root = get_plugin_root()
+    if not plugin_root:
     if not plugin_root:
         return config
 
@@ -215,7 +229,10 @@ _config_last_load = 0
 
 
 def get_config(force_reload: bool = False) -> dict:
-    """Get cached config, reloading periodically for hot-reload support."""
+    """Get cached config, reloading periodically for hot-reload support.
+
+    Returns a copy of the cached config to prevent accidental mutation.
+    """
     global _config_cache, _config_last_load
 
     now = time.time()
@@ -223,7 +240,10 @@ def get_config(force_reload: bool = False) -> dict:
         _config_cache = load_config()
         _config_last_load = now
 
-    return _config_cache
+    # Return a copy to prevent accidental mutation of cached config
+    config_copy = _config_cache.copy()
+    config_copy["display"] = _config_cache["display"].copy()
+    return config_copy
 
 
 def extract_file_from_tool_input(hook_input: dict) -> str:
@@ -282,7 +302,7 @@ def read_state() -> dict:
     if STATE_FILE.exists():
         try:
             return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
             pass
     return {}
 
@@ -768,6 +788,7 @@ def run_daemon():
     current_app_id = app_id
     last_sent = {}  # Track last sent state to avoid redundant updates
     last_orphan_check = 0  # Track when we last checked for dead sessions
+    discord_connect_attempts = 0  # Track connection retry attempts
 
     while True:
         try:
@@ -798,13 +819,18 @@ def run_daemon():
 
             # Try to connect if not connected
             if not connected:
+                discord_connect_attempts += 1
+                if discord_connect_attempts > DISCORD_CONNECT_MAX_RETRIES:
+                    log(f"ERROR: Cannot connect to Discord after {DISCORD_CONNECT_MAX_RETRIES} attempts. Is Discord running?")
+                    break
                 try:
                     rpc = Presence(current_app_id)
                     rpc.connect()
                     connected = True
+                    discord_connect_attempts = 0  # Reset on successful connection
                     log(f"Connected to Discord with App ID: {current_app_id}")
                 except Exception as e:
-                    log(f"Failed to connect to Discord: {e}")
+                    log(f"Failed to connect to Discord (attempt {discord_connect_attempts}/{DISCORD_CONNECT_MAX_RETRIES}): {e}")
                     time.sleep(5)
                     continue
 

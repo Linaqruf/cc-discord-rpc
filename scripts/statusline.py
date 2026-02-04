@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
 """
-Apple Finder Path Bar Statusline for Claude Code
+Claude Code Statusline with Discord RPC Integration
 
-Aesthetic: macOS Finder breadcrumb style
-Clean, spacious, typography-first, subtle hierarchy
+Displays a macOS Finder-style status bar showing model, tokens, cost, and git branch.
+Also updates state.json to provide token/cost data to the Discord RPC daemon.
+
+Setup in ~/.claude/settings.json:
+{
+  "statusLine": {
+    "type": "command",
+    "command": "python /path/to/cc-discord-rpc/scripts/statusline.py"
+  }
+}
 """
 import json
 import sys
@@ -116,7 +124,7 @@ def read_state() -> dict:
     if STATE_FILE.exists():
         try:
             return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
             pass
     return {}
 
