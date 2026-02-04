@@ -325,6 +325,16 @@ def get_claude_ancestor_pid() -> int | None:
         return None
 
 
+def get_session_pid() -> int:
+    """Get Claude ancestor PID, falling back to parent PID."""
+    pid = get_claude_ancestor_pid()
+    if pid:
+        return pid
+    fallback = os.getppid()
+    log(f"Warning: Could not find Claude ancestor, using parent PID {fallback}")
+    return fallback
+
+
 def read_sessions() -> dict:
     """Read active sessions {pid: timestamp}."""
     if SESSIONS_FILE.exists():
@@ -390,12 +400,11 @@ def cleanup_dead_sessions() -> int:
     return len(alive_sessions)
 
 
-def get_model_from_jsonl() -> str:
-    """Get model name from most recent JSONL file."""
+def find_most_recent_jsonl() -> Path | None:
+    """Find the most recently modified JSONL file in PROJECTS_DIR."""
     if not PROJECTS_DIR.exists():
-        return ""
+        return None
 
-    # Find most recent .jsonl file
     jsonl_files = []
     for path in PROJECTS_DIR.rglob("*.jsonl"):
         try:
@@ -404,11 +413,17 @@ def get_model_from_jsonl() -> str:
             continue
 
     if not jsonl_files:
-        return ""
+        return None
 
-    # Sort by modification time, get most recent
     jsonl_files.sort(key=lambda x: x[1], reverse=True)
-    recent_file = jsonl_files[0][0]
+    return jsonl_files[0][0]
+
+
+def get_model_from_jsonl() -> str:
+    """Get model name from most recent JSONL file."""
+    recent_file = find_most_recent_jsonl()
+    if not recent_file:
+        return ""
 
     # Parse last assistant message with model
     last_model = ""
@@ -455,31 +470,19 @@ def get_session_tokens_and_cost(session_id: str = "") -> dict:
         "cost": 0.0,
         "simple_cost": 0.0,
     }
-    if not PROJECTS_DIR.exists():
-        return empty_result
 
     # Find JSONL file for current session or most recent
     jsonl_file = None
-    if session_id:
+    if session_id and PROJECTS_DIR.exists():
         # Try to find file matching session ID
         for path in PROJECTS_DIR.rglob(f"{session_id}.jsonl"):
             jsonl_file = path
             break
 
     if not jsonl_file:
-        # Fall back to most recent JSONL file
-        jsonl_files = []
-        for path in PROJECTS_DIR.rglob("*.jsonl"):
-            try:
-                jsonl_files.append((path, path.stat().st_mtime))
-            except OSError:
-                continue
-
-        if not jsonl_files:
+        jsonl_file = find_most_recent_jsonl()
+        if not jsonl_file:
             return empty_result
-
-        jsonl_files.sort(key=lambda x: x[1], reverse=True)
-        jsonl_file = jsonl_files[0][0]
 
     # Parse all assistant messages and sum tokens
     total_input = 0
@@ -661,13 +664,13 @@ def run_daemon():
 
             if show_simple:
                 # Simple view: input/output tokens only
-                tokens_display = format_tokens(simple_tokens) if simple_tokens > 0 else "0"
-                cost_display = f"${simple_cost:.2f}" if simple_cost > 0 else "$0.00"
+                tokens_display = format_tokens(simple_tokens)
+                cost_display = f"${simple_cost:.2f}"
                 state_line = f"{model} • {tokens_display} tokens • {cost_display}" if model else f"{tokens_display} tokens • {cost_display}"
             else:
                 # Cached view: total with cache
-                tokens_display = format_tokens(cached_tokens) if cached_tokens > 0 else "0"
-                cost_display = f"${cost:.2f}" if cost > 0 else "$0.00"
+                tokens_display = format_tokens(cached_tokens)
+                cost_display = f"${cost:.2f}"
                 state_line = f"{model} • {tokens_display} cached • {cost_display}" if model else f"{tokens_display} cached • {cost_display}"
 
             # Only update if something changed (check every cycle)
@@ -712,12 +715,8 @@ def cmd_start():
     project = hook_input.get("cwd", os.environ.get("CLAUDE_PROJECT_DIR", ""))
     project_name = get_project_name(project) if project else get_project_name()
 
-    # Register this session by Claude Code's PID (walk up process tree)
-    claude_pid = get_claude_ancestor_pid()
-    if not claude_pid:
-        # Fallback to parent PID if we can't find Claude
-        claude_pid = os.getppid()
-        log(f"Warning: Could not find Claude ancestor, using parent PID {claude_pid}")
+    # Register this session by Claude Code's PID
+    claude_pid = get_session_pid()
     session_count = add_session(claude_pid)
 
     # Update state
@@ -814,9 +813,7 @@ def cmd_update():
 def cmd_stop():
     """Handle 'stop' command - clear presence and stop daemon."""
     # Unregister this session by Claude Code's PID
-    claude_pid = get_claude_ancestor_pid()
-    if not claude_pid:
-        claude_pid = os.getppid()
+    claude_pid = get_session_pid()
     remaining = remove_session(claude_pid)
 
     if remaining > 0:
