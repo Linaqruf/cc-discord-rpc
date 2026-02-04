@@ -110,6 +110,23 @@ def get_project_name() -> str:
     return Path(cwd).name
 
 
+def get_git_branch(project_path: str) -> str:
+    """Get current git branch name."""
+    import subprocess
+    if not project_path:
+        return ""
+    try:
+        result = subprocess.run(
+            ["git", "-C", project_path, "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return ""
+
+
 def read_hook_input() -> dict:
     """Read JSON input from stdin (provided by Claude Code hooks)."""
     try:
@@ -182,18 +199,25 @@ def run_daemon():
             # Update presence
             tool = state.get("tool", "")
             project = state.get("project", "Claude Code")
+            git_branch = state.get("git_branch", "")
             session_start = state.get("session_start", int(time.time()))
 
-            details = TOOL_DISPLAY.get(tool, "Working")
+            activity = TOOL_DISPLAY.get(tool, "Working")
+
+            # Build details line: "Working on: project (branch)"
+            if git_branch:
+                details = f"Working on: {project} ({git_branch})"
+            else:
+                details = f"Working on: {project}"
 
             # Only update if something changed
-            current = {"details": details, "project": project}
+            current = {"details": details, "activity": activity}
             if current != last_sent:
-                log(f"Sending to Discord: {details} on {project}")
+                log(f"Sending to Discord: {details} | {activity}")
                 try:
                     rpc.update(
-                        state=f"on {project}",
                         details=details,
+                        state=activity,
                         start=session_start,
                         large_image="claude",
                         large_text="Claude Code",
@@ -236,6 +260,8 @@ def cmd_start():
         state["session_start"] = now
 
     state["project"] = project_name
+    state["project_path"] = project
+    state["git_branch"] = get_git_branch(project) if project else ""
     state["last_update"] = now
     state["tool"] = ""
     write_state(state)
