@@ -59,17 +59,30 @@ MODEL_PRICING = {
     "claude-haiku-4-5-20241022": (1.00, 5.00, 0.10),
 }
 
-# Tool to display name mapping
+# Tool to display name mapping (keep short for Discord limit)
 TOOL_DISPLAY = {
+    # File operations
     "Edit": "Editing",
     "Write": "Writing",
     "Read": "Reading",
-    "Bash": "Running command",
-    "Glob": "Searching files",
-    "Grep": "Searching code",
-    "Task": "Delegating task",
-    "WebFetch": "Fetching web content",
+    "Glob": "Searching",
+    "Grep": "Grepping",
+    "LS": "Browsing",
+    # Execution
+    "Bash": "Running",
+    "Task": "Delegating",
+    # Web
+    "WebFetch": "Fetching",
     "WebSearch": "Researching",
+    # Notebook
+    "NotebookEdit": "Editing",
+    "NotebookRead": "Reading",
+    # Interaction
+    "AskUserQuestion": "Asking",
+    "TodoRead": "Reviewing",
+    "TodoWrite": "Planning",
+    # MCP (generic)
+    "mcp": "Using MCP",
 }
 
 # Idle timeout in seconds (5 minutes) - after this, show "Idling" instead of last activity
@@ -442,8 +455,12 @@ def run_daemon():
             # Determine activity - show "Idling" if idle timeout reached
             if is_idle:
                 activity = "Idling"
+            elif tool in TOOL_DISPLAY:
+                activity = TOOL_DISPLAY[tool]
+            elif tool.startswith("mcp__"):
+                activity = "Using MCP"
             else:
-                activity = TOOL_DISPLAY.get(tool, "Working")
+                activity = "Working"
 
             # Build details line: "Activity on project (branch)"
             if git_branch:
