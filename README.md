@@ -5,20 +5,22 @@ Claude Code plugin that displays your coding activity as Discord Rich Presence.
 ## Features
 
 - **Activity display**: Editing, Reading, Running command, Searching, etc.
+- **File display**: Shows filename when editing (e.g., "Editing main.py")
 - **Project info**: Name (from git remote or folder) + branch
 - **Model display**: Opus 4.5, Sonnet 4, Haiku 4.5, etc.
 - **Token tracking**: Cycling display showing simple vs cached tokens
 - **Cost tracking**: Real-time API cost based on model pricing
 - **Multi-session**: Supports multiple Claude Code terminals
-- **Idle state**: Shows "Idling" after 5 min (keeps timer running)
+- **Idle state**: Shows "Idling" after configurable timeout (default 5 min)
 - **Elapsed time**: Time since session start
+- **Configurable**: YAML config for custom app ID and display preferences
 
 ## Display
 
 ```
 ┌─────────────────────────────────────────┐
 │ Kana Code                               │
-│ Editing on my-project (main)            │
+│ Editing main.py on my-project (main)    │
 │ Opus 4.5 • 22.9k tokens • $0.18         │
 │ ⏱ 1:23:45                               │
 └─────────────────────────────────────────┘
@@ -32,13 +34,13 @@ The status line cycles every 8 seconds:
 
 - Python 3.10+
 - Discord desktop app running
-- pypresence library
+- pypresence and pyyaml libraries
 
 ## Installation
 
-1. Install pypresence:
+1. Install dependencies:
    ```bash
-   pip install pypresence
+   pip install pypresence pyyaml
    ```
 
 2. Copy this plugin to your Claude Code plugins directory:
@@ -52,14 +54,36 @@ The status line cycles every 8 seconds:
 
 3. Restart Claude Code
 
-## Discord Setup
+## Configuration
 
-The plugin uses Discord Application ID `1330919293709324449`. To use your own:
+Edit `.claude-plugin/config.yaml` to customize the plugin:
+
+```yaml
+# Custom Discord Application ID (optional)
+discord_app_id: null  # Default: 1330919293709324449
+
+# Display settings
+display:
+  show_tokens: true    # Token count (22.9k tokens)
+  show_cost: true      # API cost ($0.18)
+  show_model: true     # Model name (Opus 4.5)
+  show_branch: true    # Git branch (main)
+  show_file: true      # Filename when editing
+
+# Idle timeout in seconds (default: 300 = 5 minutes)
+idle_timeout: 300
+```
+
+Config changes are hot-reloaded every 30 seconds.
+
+## Custom Discord App
+
+To use your own Discord application (for custom branding):
 
 1. Go to [Discord Developer Portal](https://discord.com/developers/applications)
 2. Create a new application
-3. Copy the Application ID
-4. Edit `scripts/presence.py` and update `DISCORD_APP_ID`
+3. Copy the Application ID (17-19 digit number)
+4. Set `discord_app_id` in `.claude-plugin/config.yaml`
 5. Upload assets (optional): Add a "claude" image in Rich Presence > Art Assets
 
 ## How It Works
@@ -108,14 +132,14 @@ Costs are calculated using official Anthropic API pricing:
 
 ## Data Files
 
-Location: `%APPDATA%/cc-discord-rpc/` (Windows)
+Location: `%APPDATA%/cc-discord-rpc/` (Windows) or `~/.local/share/cc-discord-rpc/` (Linux/macOS)
 
 | File | Purpose |
 |------|---------|
 | `state.json` | Current session state |
+| `sessions.json` | Active session PIDs |
 | `daemon.pid` | Background process ID |
 | `daemon.log` | Debug log |
-| `refcount` | Active session count |
 
 ## Troubleshooting
 

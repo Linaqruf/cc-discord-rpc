@@ -15,6 +15,13 @@ import signal
 from pathlib import Path
 from datetime import datetime
 
+# Optional YAML support for config file
+try:
+    import yaml
+    YAML_AVAILABLE = True
+except ImportError:
+    YAML_AVAILABLE = False
+
 # Discord Application ID
 DISCORD_APP_ID = "1330919293709324449"
 
@@ -93,6 +100,24 @@ TOOL_DISPLAY = {
 # Idle timeout in seconds (5 minutes) - after this, show "Idling" instead of last activity
 IDLE_TIMEOUT = 5 * 60
 
+# Configuration
+CONFIG_FILE_NAME = "config.yaml"
+DEFAULT_CONFIG = {
+    "discord_app_id": None,  # Uses DISCORD_APP_ID constant if None
+    "display": {
+        "show_tokens": True,
+        "show_cost": True,
+        "show_model": True,
+        "show_branch": True,
+        "show_file": True,
+    },
+    "idle_timeout": 300,  # 5 minutes in seconds
+}
+CONFIG_RELOAD_INTERVAL = 30  # Reload config every 30 seconds
+
+# Tools that operate on files (for filename display)
+FILE_TOOLS = {"Edit", "Write", "Read", "NotebookEdit", "NotebookRead"}
+
 
 def log(message: str):
     """Append message to log file."""
@@ -103,6 +128,141 @@ def log(message: str):
             f.write(f"[{timestamp}] {message}\n")
     except OSError:
         pass  # Logging should never crash the daemon
+
+
+def get_plugin_root() -> Path | None:
+    """Get plugin root directory from CLAUDE_PLUGIN_ROOT environment variable."""
+    plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT")
+    if plugin_root:
+        path = Path(plugin_root)
+        if path.exists():
+            return path
+    return None
+
+
+def load_config() -> dict:
+    """Load configuration from YAML file, falling back to defaults.
+
+    Config location: {CLAUDE_PLUGIN_ROOT}/.claude-plugin/config.yaml
+
+    Returns merged config with defaults for any missing keys.
+    """
+    config = DEFAULT_CONFIG.copy()
+    config["display"] = DEFAULT_CONFIG["display"].copy()
+
+    if not YAML_AVAILABLE:
+        return config
+
+    plugin_root = get_plugin_root()
+    if not plugin_root:
+        return config
+
+    config_path = plugin_root / ".claude-plugin" / CONFIG_FILE_NAME
+    if not config_path.exists():
+        return config
+
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            user_config = yaml.safe_load(f) or {}
+
+        # Merge discord_app_id (validate 17-19 digit numeric string)
+        if "discord_app_id" in user_config and user_config["discord_app_id"]:
+            app_id = str(user_config["discord_app_id"])
+            if app_id.isdigit() and 17 <= len(app_id) <= 19:
+                config["discord_app_id"] = app_id
+            else:
+                log(f"Warning: Invalid discord_app_id format '{app_id}', using default")
+
+        # Merge display toggles
+        if "display" in user_config and isinstance(user_config["display"], dict):
+            for key in config["display"]:
+                if key in user_config["display"]:
+                    config["display"][key] = bool(user_config["display"][key])
+
+        # Merge idle_timeout
+        if "idle_timeout" in user_config:
+            timeout = user_config["idle_timeout"]
+            if isinstance(timeout, (int, float)) and timeout > 0:
+                config["idle_timeout"] = int(timeout)
+            else:
+                log(f"Warning: Invalid idle_timeout '{timeout}', using default")
+
+        log(f"Loaded config from {config_path}")
+
+    except yaml.YAMLError as e:
+        log(f"Error parsing config YAML: {e}")
+    except OSError as e:
+        log(f"Error reading config file: {e}")
+
+    return config
+
+
+# Global config cache for daemon
+_config_cache = None
+_config_last_load = 0
+
+
+def get_config(force_reload: bool = False) -> dict:
+    """Get cached config, reloading periodically for hot-reload support."""
+    global _config_cache, _config_last_load
+
+    now = time.time()
+    if force_reload or _config_cache is None or (now - _config_last_load > CONFIG_RELOAD_INTERVAL):
+        _config_cache = load_config()
+        _config_last_load = now
+
+    return _config_cache
+
+
+def extract_file_from_tool_input(hook_input: dict) -> str:
+    """Extract filename from hook input's tool_input field.
+
+    For Edit/Write/Read tools, tool_input contains:
+    {
+        "file_path": "/path/to/file.py",
+        ...
+    }
+
+    Returns just the filename (not full path), or empty string if not available.
+    """
+    tool_name = hook_input.get("tool_name", "")
+    if tool_name not in FILE_TOOLS:
+        return ""
+
+    tool_input = hook_input.get("tool_input", {})
+    if not isinstance(tool_input, dict):
+        return ""
+
+    file_path = tool_input.get("file_path", "")
+    if not file_path:
+        return ""
+
+    try:
+        return Path(file_path).name
+    except Exception:
+        return ""
+
+
+def truncate_filename(filename: str, max_length: int = 25) -> str:
+    """Truncate filename for Discord display limits.
+
+    If filename is too long, truncate middle with '...' while preserving extension.
+    """
+    if len(filename) <= max_length:
+        return filename
+
+    stem = Path(filename).stem
+    suffix = Path(filename).suffix
+
+    # Calculate how much of stem we can keep
+    available = max_length - len(suffix) - 3  # 3 for '...'
+    if available < 5:
+        # Very long extension, just truncate from end
+        return filename[:max_length - 3] + "..."
+
+    # Keep start and end of stem
+    half = available // 2
+    return stem[:half] + "..." + stem[-half:] + suffix
 
 
 def read_state() -> dict:
@@ -576,6 +736,11 @@ def run_daemon():
     write_pid()
     atexit.register(remove_pid)
 
+    # Load initial config
+    config = get_config(force_reload=True)
+    app_id = config.get("discord_app_id") or DISCORD_APP_ID
+    log(f"Using Discord App ID: {app_id}")
+
     # Handle graceful shutdown
     def shutdown(signum, frame):
         log("Received shutdown signal")
@@ -588,11 +753,28 @@ def run_daemon():
     # Connect to Discord
     rpc = None
     connected = False
+    current_app_id = app_id
     last_sent = {}  # Track last sent state to avoid redundant updates
     last_orphan_check = 0  # Track when we last checked for dead sessions
 
     while True:
         try:
+            # Periodically reload config for hot-reload support
+            config = get_config()
+            new_app_id = config.get("discord_app_id") or DISCORD_APP_ID
+
+            # Check if app ID changed - need to reconnect
+            if new_app_id != current_app_id and connected:
+                log(f"App ID changed from {current_app_id} to {new_app_id}, reconnecting...")
+                try:
+                    rpc.clear()
+                    rpc.close()
+                except Exception:
+                    pass
+                connected = False
+                rpc = None
+                current_app_id = new_app_id
+
             # Periodically check for dead sessions (orphan cleanup)
             now = time.time()
             if now - last_orphan_check > ORPHAN_CHECK_INTERVAL:
@@ -605,10 +787,10 @@ def run_daemon():
             # Try to connect if not connected
             if not connected:
                 try:
-                    rpc = Presence(DISCORD_APP_ID)
+                    rpc = Presence(current_app_id)
                     rpc.connect()
                     connected = True
-                    log("Connected to Discord")
+                    log(f"Connected to Discord with App ID: {current_app_id}")
                 except Exception as e:
                     log(f"Failed to connect to Discord: {e}")
                     time.sleep(5)
@@ -621,18 +803,28 @@ def run_daemon():
                 time.sleep(1)
                 continue
 
+            # Get display settings from config
+            display_cfg = config.get("display", {})
+            show_tokens = display_cfg.get("show_tokens", True)
+            show_cost = display_cfg.get("show_cost", True)
+            show_model = display_cfg.get("show_model", True)
+            show_branch = display_cfg.get("show_branch", True)
+            show_file = display_cfg.get("show_file", True)
+
             # Check for idle timeout - show "Idling" instead of clearing
             last_update = state.get("last_update", 0)
-            is_idle = time.time() - last_update > IDLE_TIMEOUT
+            idle_timeout = config.get("idle_timeout", IDLE_TIMEOUT)
+            is_idle = time.time() - last_update > idle_timeout
 
-            # Update presence
+            # Get state values
             tool = state.get("tool", "")
             project = state.get("project", "Claude Code")
-            git_branch = state.get("git_branch", "")
-            model = state.get("model", "")
+            git_branch = state.get("git_branch", "") if show_branch else ""
+            model = state.get("model", "") if show_model else ""
+            current_file = state.get("file", "") if show_file else ""
             session_start = state.get("session_start", int(time.time()))
 
-            # Get token data
+            # Get token data (only if needed for display)
             tokens = state.get("tokens", {})
             input_tokens = tokens.get("input", 0)
             output_tokens = tokens.get("output", 0)
@@ -644,18 +836,37 @@ def run_daemon():
             # Determine activity - show "Idling" if idle timeout reached
             if is_idle:
                 activity = "Idling"
+                display_file = ""  # Don't show file when idling
             elif tool in TOOL_DISPLAY:
                 activity = TOOL_DISPLAY[tool]
+                display_file = current_file if tool in FILE_TOOLS else ""
             elif tool.startswith("mcp__"):
                 activity = "Using MCP"
+                display_file = ""
             else:
                 activity = "Working"
+                display_file = ""
 
-            # Build details line: "Activity on project (branch)"
-            if git_branch:
-                details = f"{activity} on {project} ({git_branch})"
+            # Build activity string with optional filename
+            if display_file and show_file:
+                truncated_file = truncate_filename(display_file)
+                activity_str = f"{activity} {truncated_file}"
             else:
-                details = f"{activity} on {project}"
+                activity_str = activity
+
+            # Build details line: "Activity [file] on project [(branch)]"
+            if git_branch:
+                details = f"{activity_str} on {project} ({git_branch})"
+            else:
+                details = f"{activity_str} on {project}"
+
+            # Truncate details if too long for Discord (max ~128 chars)
+            if len(details) > 120:
+                if git_branch:
+                    details = f"{activity_str} on {project}"
+                if len(details) > 120:
+                    max_proj = 120 - len(activity_str) - 4
+                    details = f"{activity_str} on {project[:max(10, max_proj)]}..."
 
             # Cycle state line every 8s: 5s simple, 3s cached
             cycle_pos = int(time.time()) % 8
@@ -666,16 +877,25 @@ def run_daemon():
             # Cached = total including cache
             cached_tokens = input_tokens + output_tokens + cache_read + cache_write
 
-            if show_simple:
-                # Simple view: input/output tokens only
-                tokens_display = format_tokens(simple_tokens)
-                cost_display = f"${simple_cost:.2f}"
-                state_line = f"{model} • {tokens_display} tokens • {cost_display}" if model else f"{tokens_display} tokens • {cost_display}"
-            else:
-                # Cached view: total with cache
-                tokens_display = format_tokens(cached_tokens)
-                cost_display = f"${cost:.2f}"
-                state_line = f"{model} • {tokens_display} cached • {cost_display}" if model else f"{tokens_display} cached • {cost_display}"
+            # Build state line with config toggles
+            parts = []
+
+            if show_model and model:
+                parts.append(model)
+
+            if show_tokens:
+                if show_simple:
+                    parts.append(f"{format_tokens(simple_tokens)} tokens")
+                else:
+                    parts.append(f"{format_tokens(cached_tokens)} cached")
+
+            if show_cost:
+                if show_simple:
+                    parts.append(f"${simple_cost:.2f}")
+                else:
+                    parts.append(f"${cost:.2f}")
+
+            state_line = " \u2022 ".join(parts) if parts else "Claude Code"
 
             # Only update if something changed (check every cycle)
             current = {"details": details, "state_line": state_line}
@@ -807,6 +1027,14 @@ def cmd_update():
     state["tool"] = tool_name
     state["last_update"] = int(time.time())
 
+    # Extract and store filename if this is a file operation
+    filename = extract_file_from_tool_input(hook_input)
+    if filename:
+        state["file"] = filename
+    elif tool_name not in FILE_TOOLS:
+        # Clear file if tool is not a file operation
+        state["file"] = ""
+
     # Refresh token counts
     session_id = state.get("session_id", "")
     tokens = get_session_tokens_and_cost(session_id)
@@ -814,7 +1042,7 @@ def cmd_update():
 
     write_state(state)
 
-    log(f"Updated activity: {tool_name}")
+    log(f"Updated: {tool_name}" + (f" ({filename})" if filename else ""))
 
 
 def cmd_stop():
