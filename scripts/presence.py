@@ -112,6 +112,10 @@ DEFAULT_CONFIG = {
         "show_file": False,  # Disabled by default (minor performance overhead)
     },
     "idle_timeout": 300,  # 5 minutes in seconds
+    # Data source for tokens/cost:
+    # - "statusline": Use Claude Code statusline (recommended, no JSONL parsing)
+    # - "jsonl": Parse JSONL files (legacy, higher overhead)
+    "data_source": "statusline",
 }
 CONFIG_RELOAD_INTERVAL = 30  # Reload config every 30 seconds
 
@@ -186,6 +190,14 @@ def load_config() -> dict:
                 config["idle_timeout"] = int(timeout)
             else:
                 log(f"Warning: Invalid idle_timeout '{timeout}', using default")
+
+        # Merge data_source
+        if "data_source" in user_config:
+            source = user_config["data_source"]
+            if source in ("statusline", "jsonl"):
+                config["data_source"] = source
+            else:
+                log(f"Warning: Invalid data_source '{source}', using default")
 
         log(f"Loaded config from {config_path}")
 
@@ -1038,13 +1050,16 @@ def cmd_update():
         elif tool_name not in FILE_TOOLS:
             state["file"] = ""
 
-    # Refresh token counts only if needed for display (saves ~20-50ms)
-    show_tokens = config.get("display", {}).get("show_tokens", True)
-    show_cost = config.get("display", {}).get("show_cost", True)
-    if show_tokens or show_cost:
-        session_id = state.get("session_id", "")
-        tokens = get_session_tokens_and_cost(session_id)
-        state["tokens"] = tokens
+    # Refresh token counts only if using JSONL data source
+    # When using statusline, tokens are updated by statusline.py (no overhead here)
+    data_source = config.get("data_source", "statusline")
+    if data_source == "jsonl":
+        show_tokens = config.get("display", {}).get("show_tokens", True)
+        show_cost = config.get("display", {}).get("show_cost", True)
+        if show_tokens or show_cost:
+            session_id = state.get("session_id", "")
+            tokens = get_session_tokens_and_cost(session_id)
+            state["tokens"] = tokens
 
     write_state(state)
 

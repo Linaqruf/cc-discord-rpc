@@ -72,9 +72,31 @@ display:
 
 # Idle timeout in seconds (default: 300 = 5 minutes)
 idle_timeout: 300
+
+# Data source: "statusline" (recommended) or "jsonl" (legacy)
+data_source: statusline
 ```
 
 Config changes are hot-reloaded every 30 seconds.
+
+## Statusline Setup (Recommended)
+
+For best performance, set up the statusline integration to get token/cost data without JSONL parsing overhead.
+
+Add to `~/.claude/settings.json`:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "python /path/to/cc-discord-rpc/scripts/statusline.py"
+  }
+}
+```
+
+Replace `/path/to/cc-discord-rpc` with your actual plugin path.
+
+**Bonus**: This also adds a status line to Claude Code showing `[Model] tokens | $cost`.
 
 ## Custom Discord App
 
@@ -89,7 +111,22 @@ To use your own Discord application (for custom branding):
 ## How It Works
 
 ```
-Claude Code Hooks → presence.py → pypresence → Discord RPC
+┌─────────────────────────────────────────────────────┐
+│                   Claude Code                        │
+├─────────────────────────────────────────────────────┤
+│  Hooks (events)        │  Statusline (token data)   │
+│  └─ presence.py        │  └─ statusline.py          │
+└───────────┬────────────┴────────────┬───────────────┘
+            │                         │
+            ▼                         ▼
+      ┌─────────────────────────────────┐
+      │          state.json             │
+      └───────────────┬─────────────────┘
+                      │
+                      ▼
+      ┌─────────────────────────────────┐
+      │    Daemon → Discord RPC         │
+      └─────────────────────────────────┘
 ```
 
 | Hook | Trigger | Action |
