@@ -96,10 +96,13 @@ IDLE_TIMEOUT = 5 * 60
 
 def log(message: str):
     """Append message to log file."""
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(f"[{timestamp}] {message}\n")
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"[{timestamp}] {message}\n")
+    except OSError:
+        pass  # Logging should never crash the daemon
 
 
 def read_state() -> dict:
@@ -114,8 +117,11 @@ def read_state() -> dict:
 
 def write_state(state: dict):
     """Write state to state file."""
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    except OSError as e:
+        log(f"Warning: Could not write state: {e}")
 
 
 def get_daemon_pid() -> int | None:
@@ -211,13 +217,20 @@ def is_process_alive(pid: int) -> bool:
         if handle:
             kernel32.CloseHandle(handle)
             return True
+        # Check why OpenProcess failed
+        error = ctypes.get_last_error()
+        # ERROR_ACCESS_DENIED (5) means process exists but we can't access it
+        if error == 5:
+            return True
         return False
     else:
         try:
             os.kill(pid, 0)  # Doesn't kill, just checks
             return True
-        except (ProcessLookupError, PermissionError, OSError):
+        except ProcessLookupError:
             return False
+        except PermissionError:
+            return True  # Process exists but we lack permission
 
 
 def get_claude_ancestor_pid() -> int | None:
@@ -233,13 +246,14 @@ def get_claude_ancestor_pid() -> int | None:
         CloseHandle = ctypes.windll.kernel32.CloseHandle
 
         TH32CS_SNAPPROCESS = 0x00000002
+        INVALID_HANDLE_VALUE = -1
 
         class PROCESSENTRY32(ctypes.Structure):
             _fields_ = [
                 ("dwSize", wintypes.DWORD),
                 ("cntUsage", wintypes.DWORD),
                 ("th32ProcessID", wintypes.DWORD),
-                ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+                ("th32DefaultHeapID", ctypes.c_void_p),  # ULONG_PTR
                 ("th32ModuleID", wintypes.DWORD),
                 ("cntThreads", wintypes.DWORD),
                 ("th32ParentProcessID", wintypes.DWORD),
@@ -250,23 +264,24 @@ def get_claude_ancestor_pid() -> int | None:
 
         # Build a map of pid -> (parent_pid, exe_name)
         snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-        if snapshot == -1:
+        if snapshot == INVALID_HANDLE_VALUE:
             return None
 
         process_map = {}
-        pe32 = PROCESSENTRY32()
-        pe32.dwSize = ctypes.sizeof(PROCESSENTRY32)
+        try:
+            pe32 = PROCESSENTRY32()
+            pe32.dwSize = ctypes.sizeof(PROCESSENTRY32)
 
-        if Process32First(snapshot, ctypes.byref(pe32)):
-            while True:
-                pid = pe32.th32ProcessID
-                ppid = pe32.th32ParentProcessID
-                exe = pe32.szExeFile.decode("utf-8", errors="ignore").lower()
-                process_map[pid] = (ppid, exe)
-                if not Process32Next(snapshot, ctypes.byref(pe32)):
-                    break
-
-        CloseHandle(snapshot)
+            if Process32First(snapshot, ctypes.byref(pe32)):
+                while True:
+                    pid = pe32.th32ProcessID
+                    ppid = pe32.th32ParentProcessID
+                    exe = pe32.szExeFile.decode("utf-8", errors="ignore").lower()
+                    process_map[pid] = (ppid, exe)
+                    if not Process32Next(snapshot, ctypes.byref(pe32)):
+                        break
+        finally:
+            CloseHandle(snapshot)
 
         # Walk up the tree from current process looking for node.exe (Claude Code)
         current_pid = os.getpid()
