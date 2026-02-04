@@ -72,8 +72,8 @@ TOOL_DISPLAY = {
     "WebSearch": "Researching",
 }
 
-# Idle timeout in seconds (15 minutes)
-IDLE_TIMEOUT = 15 * 60
+# Idle timeout in seconds (5 minutes) - after this, show "Idling" instead of last activity
+IDLE_TIMEOUT = 5 * 60
 
 
 def log(message: str):
@@ -419,19 +419,9 @@ def run_daemon():
                 time.sleep(1)
                 continue
 
-            # Check for idle timeout
+            # Check for idle timeout - show "Idling" instead of clearing
             last_update = state.get("last_update", 0)
-            if time.time() - last_update > IDLE_TIMEOUT:
-                log("Idle timeout reached, clearing presence")
-                if rpc:
-                    try:
-                        rpc.clear()
-                    except:
-                        pass
-                write_state({})
-                last_sent = {}
-                time.sleep(5)
-                continue
+            is_idle = time.time() - last_update > IDLE_TIMEOUT
 
             # Update presence
             tool = state.get("tool", "")
@@ -449,13 +439,17 @@ def run_daemon():
             cost = tokens.get("cost", 0.0)
             simple_cost = tokens.get("simple_cost", 0.0)
 
-            activity = TOOL_DISPLAY.get(tool, "Working")
-
-            # Build details line: "Activity project (branch)"
-            if git_branch:
-                details = f"{activity} {project} ({git_branch})"
+            # Determine activity - show "Idling" if idle timeout reached
+            if is_idle:
+                activity = "Idling"
             else:
-                details = f"{activity} {project}"
+                activity = TOOL_DISPLAY.get(tool, "Working")
+
+            # Build details line: "Activity on project (branch)"
+            if git_branch:
+                details = f"{activity} on {project} ({git_branch})"
+            else:
+                details = f"{activity} on {project}"
 
             # Cycle state line every 8s: 5s simple, 3s cached
             cycle_pos = int(time.time()) % 8
