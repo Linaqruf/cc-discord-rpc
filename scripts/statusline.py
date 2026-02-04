@@ -1,17 +1,9 @@
 #!/usr/bin/env python3
 """
-Statusline script for Claude Code - updates Discord RPC state with token/cost data.
+Apple Finder Path Bar Statusline for Claude Code
 
-This script is called by Claude Code's statusline feature every ~300ms.
-It reads token/cost data from stdin (JSON) and writes to state.json for the daemon.
-
-Setup in ~/.claude/settings.json:
-{
-  "statusLine": {
-    "type": "command",
-    "command": "python /path/to/cc-discord-rpc/scripts/statusline.py"
-  }
-}
+Aesthetic: macOS Finder breadcrumb style
+Clean, spacious, typography-first, subtle hierarchy
 """
 import json
 import sys
@@ -19,29 +11,108 @@ import os
 from pathlib import Path
 from datetime import datetime
 
-# Data directory (same as presence.py)
+# Fix Windows console encoding for Unicode characters
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding='utf-8')
+
+# ═══════════════════════════════════════════════════════════════
+# Apple System Colors (ANSI approximations)
+# ═══════════════════════════════════════════════════════════════
+
+class C:
+    """ANSI color codes - Apple system colors"""
+    RESET = '\x1b[0m'
+    BOLD = '\x1b[1m'
+    DIM = '\x1b[2m'
+
+    # Apple palette
+    WHITE = '\x1b[97m'      # Primary text
+    GRAY = '\x1b[90m'       # Secondary/dim
+    BLUE = '\x1b[94m'       # System Blue - accent
+    GREEN = '\x1b[92m'      # System Green - positive
+    ORANGE = '\x1b[93m'     # System Orange - warning
+    RED = '\x1b[91m'        # System Red - critical
+
+
+# ═══════════════════════════════════════════════════════════════
+# Helpers
+# ═══════════════════════════════════════════════════════════════
+
+def format_tokens(count: int) -> str:
+    """Format token count (e.g., 29.4k, 1.2M)"""
+    if count >= 1_000_000:
+        return f"{count / 1_000_000:.1f}M"
+    if count >= 100_000:
+        return f"{count / 1_000:.0f}k"
+    if count >= 1_000:
+        return f"{count / 1_000:.1f}k"
+    return f"{count:,}"
+
+
+def format_cost(cost: float) -> str:
+    """Format cost with appropriate precision"""
+    if cost >= 100:
+        return f"${cost:.0f}"
+    if cost >= 10:
+        return f"${cost:.1f}"
+    if cost >= 0.01:
+        return f"${cost:.2f}"
+    return f"${cost:.3f}"
+
+
+def create_progress_bar(percent: float, width: int = 10) -> str:
+    """Create Apple-style progress bar with color coding"""
+    filled = round((percent / 100) * width)
+    empty = width - filled
+
+    filled_char = '█'
+    empty_char = '░'
+
+    # Color based on usage (Apple system colors)
+    if percent > 95:
+        bar_color = C.RED
+    elif percent > 80:
+        bar_color = C.ORANGE
+    else:
+        bar_color = C.WHITE
+
+    return f"{bar_color}{filled_char * filled}{C.GRAY}{empty_char * empty}{C.RESET}"
+
+
+def get_git_branch(cwd: str) -> str | None:
+    """Get current git branch from .git/HEAD"""
+    try:
+        git_head = Path(cwd) / '.git' / 'HEAD'
+        if git_head.exists():
+            head = git_head.read_text().strip()
+            if head.startswith('ref: refs/heads/'):
+                return head.replace('ref: refs/heads/', '')
+    except Exception:
+        pass
+    return None
+
+
+def truncate(s: str, max_len: int) -> str:
+    """Truncate string with ellipsis"""
+    if len(s) <= max_len:
+        return s
+    return s[:max_len - 1] + '…'
+
+
+# ═══════════════════════════════════════════════════════════════
+# State Management (for Discord RPC integration)
+# ═══════════════════════════════════════════════════════════════
+
 if sys.platform == "win32":
     DATA_DIR = Path(os.environ.get("APPDATA", "")) / "cc-discord-rpc"
 else:
     DATA_DIR = Path.home() / ".local" / "share" / "cc-discord-rpc"
 
 STATE_FILE = DATA_DIR / "state.json"
-LOG_FILE = DATA_DIR / "daemon.log"
-
-
-def log(message: str):
-    """Append message to log file."""
-    try:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(f"[{timestamp}] [statusline] {message}\n")
-    except OSError:
-        pass
 
 
 def read_state() -> dict:
-    """Read current state from state file."""
+    """Read current state from state file"""
     if STATE_FILE.exists():
         try:
             return json.loads(STATE_FILE.read_text(encoding="utf-8"))
@@ -51,93 +122,98 @@ def read_state() -> dict:
 
 
 def write_state(state: dict):
-    """Write state to state file."""
+    """Write state to state file"""
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
-    except OSError as e:
-        log(f"Warning: Could not write state: {e}")
+    except OSError:
+        pass
 
 
-def format_tokens(count: int) -> str:
-    """Format token count for display (e.g., 12.5k, 1.2M)."""
-    if count >= 1_000_000:
-        return f"{count / 1_000_000:.1f}M"
-    elif count >= 1000:
-        return f"{count / 1000:.1f}k"
-    return str(count)
-
+# ═══════════════════════════════════════════════════════════════
+# Main
+# ═══════════════════════════════════════════════════════════════
 
 def main():
-    """Main statusline handler."""
-    # Read JSON from stdin (Claude Code statusline data)
+    # Read JSON from stdin
     try:
         data = json.load(sys.stdin)
     except (json.JSONDecodeError, ValueError):
-        # Output empty statusline on error
         print("")
         return
 
-    # Extract model info
+    # Extract data
     model_info = data.get("model", {})
-    model_display = model_info.get("display_name", "")
+    model = model_info.get("display_name", "")
     model_id = model_info.get("id", "")
 
-    # Extract cost info
     cost_info = data.get("cost", {})
-    total_cost = cost_info.get("total_cost_usd", 0.0)
+    cost = cost_info.get("total_cost_usd", 0.0)
 
-    # Extract token info
     context = data.get("context_window", {})
     total_input = context.get("total_input_tokens", 0)
     total_output = context.get("total_output_tokens", 0)
+    used_percent = context.get("used_percentage", 0.0)
 
-    # Current usage has cache info
     current_usage = context.get("current_usage") or {}
     cache_read = current_usage.get("cache_read_input_tokens", 0)
     cache_write = current_usage.get("cache_creation_input_tokens", 0)
 
-    # Calculate simple cost estimate (input + output at base rates)
-    # This is an approximation since statusline doesn't provide it
-    simple_tokens = total_input + total_output
-    # Rough estimate: assume average $4/M input, $12/M output (mid-tier pricing)
-    simple_cost = (total_input * 4 + total_output * 12) / 1_000_000
+    cwd = data.get("workspace", {}).get("current_dir", os.getcwd())
+    git_branch = get_git_branch(cwd)
 
-    # Update state.json with token data (merge with existing hook data)
+    # Update state.json for Discord RPC
     state = read_state()
-    if state:  # Only update if session exists (started by hook)
-        # Update model if we have it
-        if model_display:
-            state["model"] = model_display
-        if model_id:
-            state["model_id"] = model_id
-
-        # Update tokens
+    if state.get("session_start"):  # Only update if session exists
+        state["model"] = model
+        state["model_id"] = model_id
         state["tokens"] = {
             "input": total_input,
             "output": total_output,
             "cache_read": cache_read,
             "cache_write": cache_write,
-            "cost": total_cost,
-            "simple_cost": simple_cost,
+            "cost": cost,
+            "simple_cost": (total_input * 4 + total_output * 12) / 1_000_000,
         }
-
-        # Mark statusline update time
         state["statusline_update"] = int(datetime.now().timestamp())
-
         write_state(state)
 
-    # Output statusline for Claude Code UI
-    # This appears at the bottom of the Claude Code interface
+    # ─────────────────────────────────────────────────────────────
+    # Build Apple Finder Path Bar Statusline
+    # ─────────────────────────────────────────────────────────────
+
+    parts = []
+    chevron = f"{C.GRAY}  ›  {C.RESET}"
+
+    # Model name (primary, blue accent)
+    if model:
+        parts.append(f"{C.BLUE}{C.BOLD}{model}{C.RESET}")
+
+    # Progress bar with percentage
+    progress_bar = create_progress_bar(used_percent)
+    percent_str = round(used_percent)
+    parts.append(f"{progress_bar} {C.WHITE}{percent_str}%{C.RESET}")
+
+    # Token count
     total_tokens = total_input + total_output
     if total_tokens > 0:
         tokens_str = format_tokens(total_tokens)
-        cost_str = f"${total_cost:.2f}" if total_cost >= 0.01 else f"${total_cost:.3f}"
-        print(f"[{model_display}] {tokens_str} | {cost_str}")
-    elif model_display:
-        print(f"[{model_display}]")
-    else:
-        print("")
+        parts.append(f"{C.WHITE}{tokens_str} tokens{C.RESET}")
+
+    # Cost (green for Apple "positive" feel)
+    if cost > 0:
+        cost_str = format_cost(cost)
+        parts.append(f"{C.GREEN}{cost_str}{C.RESET}")
+
+    # Git branch (subtle, at the end)
+    if git_branch:
+        branch_display = truncate(git_branch, 16)
+        parts.append(f"{C.GRAY}{branch_display}{C.RESET}")
+
+    # Join with chevron separators (Finder breadcrumb style)
+    status_line = chevron.join(parts)
+
+    print(status_line)
 
 
 if __name__ == "__main__":
