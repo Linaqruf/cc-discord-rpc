@@ -33,19 +33,30 @@ PROJECTS_DIR = CLAUDE_DIR / "projects"
 
 # Model display names
 MODEL_DISPLAY = {
+    # Claude 4.5 series
     "claude-opus-4-5-20251101": "Opus 4.5",
+    "claude-sonnet-4-5-20250514": "Sonnet 4.5",
     "claude-sonnet-4-5-20241022": "Sonnet 4.5",
-    "claude-sonnet-4-20250514": "Sonnet 4",
+    "claude-haiku-4-5-20250414": "Haiku 4.5",
     "claude-haiku-4-5-20241022": "Haiku 4.5",
+    # Claude 4 series
+    "claude-opus-4-20250514": "Opus 4",
+    "claude-sonnet-4-20250514": "Sonnet 4",
 }
 
 # Model pricing per 1M tokens (input, output, cache_read)
-# Cache writes charged at input rate, cache reads at 10% of input
+# Cache writes charged at 1.25x input rate, cache reads at 0.1x input rate
 MODEL_PRICING = {
-    "claude-opus-4-5-20251101": (15.00, 75.00, 1.50),
-    "claude-sonnet-4-5-20241022": (3.00, 15.00, 0.30),
+    # Claude 4.5 series
+    "claude-opus-4-5-20251101": (5.00, 25.00, 0.50),
+    "claude-sonnet-4-5-20250514": (3.00, 15.00, 0.30),
+    "claude-haiku-4-5-20250414": (1.00, 5.00, 0.10),
+    # Claude 4 series
+    "claude-opus-4-20250514": (15.00, 75.00, 1.50),
     "claude-sonnet-4-20250514": (3.00, 15.00, 0.30),
-    "claude-haiku-4-5-20241022": (0.80, 4.00, 0.08),
+    # Legacy/fallback
+    "claude-sonnet-4-5-20241022": (3.00, 15.00, 0.30),
+    "claude-haiku-4-5-20241022": (1.00, 5.00, 0.10),
 }
 
 # Tool to display name mapping
