@@ -98,12 +98,13 @@ python scripts/presence.py stop
 
 Costs are calculated using official Anthropic API pricing:
 
-| Model | Input | Output | Cache Read |
-|-------|-------|--------|------------|
-| Opus 4.5 | $5/M | $25/M | $0.50/M |
-| Sonnet 4.5 | $3/M | $15/M | $0.30/M |
-| Sonnet 4 | $3/M | $15/M | $0.30/M |
-| Haiku 4.5 | $1/M | $5/M | $0.10/M |
+| Model | Input | Output | Cache Read | Cache Write |
+|-------|-------|--------|------------|-------------|
+| Opus 4.5 | $5/M | $25/M | $0.50/M | $6.25/M |
+| Sonnet 4.5 | $3/M | $15/M | $0.30/M | $3.75/M |
+| Sonnet 4 | $3/M | $15/M | $0.30/M | $3.75/M |
+| Haiku 4.5 | $1/M | $5/M | $0.10/M | $1.25/M |
+| Opus 4 | $15/M | $75/M | $1.50/M | $18.75/M |
 
 ## Data Files
 

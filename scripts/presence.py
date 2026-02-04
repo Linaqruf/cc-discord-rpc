@@ -7,6 +7,8 @@ Manages Discord RPC connection and updates presence based on Claude Code activit
 import sys
 import os
 import json
+import re
+import subprocess
 import time
 import atexit
 import signal
@@ -44,19 +46,19 @@ MODEL_DISPLAY = {
     "claude-sonnet-4-20250514": "Sonnet 4",
 }
 
-# Model pricing per 1M tokens (input, output, cache_read)
-# Cache writes charged at 1.25x input rate, cache reads at 0.1x input rate
+# Model pricing per 1M tokens (input, output, cache_read, cache_write)
+# Cache reads at 0.1x input rate, cache writes at 1.25x input rate
 MODEL_PRICING = {
     # Claude 4.5 series
-    "claude-opus-4-5-20251101": (5.00, 25.00, 0.50),
-    "claude-sonnet-4-5-20250514": (3.00, 15.00, 0.30),
-    "claude-haiku-4-5-20250414": (1.00, 5.00, 0.10),
+    "claude-opus-4-5-20251101": (5.00, 25.00, 0.50, 6.25),
+    "claude-sonnet-4-5-20250514": (3.00, 15.00, 0.30, 3.75),
+    "claude-haiku-4-5-20250414": (1.00, 5.00, 0.10, 1.25),
     # Claude 4 series
-    "claude-opus-4-20250514": (15.00, 75.00, 1.50),
-    "claude-sonnet-4-20250514": (3.00, 15.00, 0.30),
+    "claude-opus-4-20250514": (15.00, 75.00, 1.50, 18.75),
+    "claude-sonnet-4-20250514": (3.00, 15.00, 0.30, 3.75),
     # Legacy/fallback
-    "claude-sonnet-4-5-20241022": (3.00, 15.00, 0.30),
-    "claude-haiku-4-5-20241022": (1.00, 5.00, 0.10),
+    "claude-sonnet-4-5-20241022": (3.00, 15.00, 0.30, 3.75),
+    "claude-haiku-4-5-20241022": (1.00, 5.00, 0.10, 1.25),
 }
 
 # Tool to display name mapping (keep short for Discord limit)
@@ -102,7 +104,7 @@ def read_state() -> dict:
     if STATE_FILE.exists():
         try:
             return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, IOError):
+        except (json.JSONDecodeError, OSError):
             pass
     return {}
 
@@ -121,7 +123,6 @@ def get_daemon_pid() -> int | None:
         pid = int(PID_FILE.read_text().strip())
         # Check if process is actually running
         if sys.platform == "win32":
-            import subprocess
             result = subprocess.run(
                 ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
                 capture_output=True, text=True
@@ -131,7 +132,7 @@ def get_daemon_pid() -> int | None:
         else:
             os.kill(pid, 0)  # Doesn't kill, just checks
             return pid
-    except (ValueError, ProcessLookupError, PermissionError, IOError):
+    except (ValueError, ProcessLookupError, PermissionError, OSError):
         pass
     return None
 
@@ -146,7 +147,7 @@ def remove_pid():
     """Remove PID file."""
     try:
         PID_FILE.unlink()
-    except IOError:
+    except OSError:
         pass
 
 
@@ -157,9 +158,6 @@ def get_project_name(project_path: str = "") -> str:
     1. Git remote origin repo name (e.g., 'my-repo' from github.com/user/my-repo.git)
     2. Folder name as fallback
     """
-    import subprocess
-    import re
-
     if not project_path:
         project_path = os.environ.get("CLAUDE_PROJECT_DIR", os.getcwd())
 
@@ -186,7 +184,6 @@ def get_project_name(project_path: str = "") -> str:
 
 def get_git_branch(project_path: str) -> str:
     """Get current git branch name."""
-    import subprocess
     if not project_path:
         return ""
     try:
@@ -206,7 +203,7 @@ def read_refcount() -> int:
     if REFCOUNT_FILE.exists():
         try:
             return int(REFCOUNT_FILE.read_text().strip())
-        except (ValueError, IOError):
+        except (ValueError, OSError):
             pass
     return 0
 
@@ -217,10 +214,10 @@ def write_refcount(count: int):
     if count <= 0:
         try:
             REFCOUNT_FILE.unlink()
-        except IOError:
+        except OSError:
             pass
     else:
-        REFCOUNT_FILE.write_text(str(count))
+        REFCOUNT_FILE.write_text(str(count), encoding="utf-8")
 
 
 def get_model_from_jsonl() -> str:
@@ -233,7 +230,7 @@ def get_model_from_jsonl() -> str:
     for path in PROJECTS_DIR.rglob("*.jsonl"):
         try:
             jsonl_files.append((path, path.stat().st_mtime))
-        except IOError:
+        except OSError:
             continue
 
     if not jsonl_files:
@@ -256,7 +253,7 @@ def get_model_from_jsonl() -> str:
                             last_model = model
                 except json.JSONDecodeError:
                     continue
-    except IOError:
+    except OSError:
         pass
 
     return format_model_name(last_model)
@@ -278,7 +275,7 @@ def format_model_name(model_id: str) -> str:
 def get_session_tokens_and_cost(session_id: str = "") -> dict:
     """Get total tokens and cost from current session's JSONL file.
 
-    Returns: dict with input, output, cache_read, cache_write, cost
+    Returns: dict with input, output, cache_read, cache_write, cost, simple_cost
     """
     empty_result = {
         "input": 0,
@@ -304,7 +301,7 @@ def get_session_tokens_and_cost(session_id: str = "") -> dict:
         for path in PROJECTS_DIR.rglob("*.jsonl"):
             try:
                 jsonl_files.append((path, path.stat().st_mtime))
-            except IOError:
+            except OSError:
                 continue
 
         if not jsonl_files:
@@ -338,24 +335,26 @@ def get_session_tokens_and_cost(session_id: str = "") -> dict:
                         total_cache_write += usage.get("cache_creation_input_tokens", 0)
                 except json.JSONDecodeError:
                     continue
-    except IOError:
+    except OSError:
         return empty_result
 
     # Calculate cost
     cost = 0.0
     if last_model in MODEL_PRICING:
-        input_price, output_price, cache_read_price = MODEL_PRICING[last_model]
-        # Input + cache writes at input rate
-        cost += (total_input + total_cache_write) * input_price / 1_000_000
-        # Output at output rate
+        input_price, output_price, cache_read_price, cache_write_price = MODEL_PRICING[last_model]
+        # Input tokens at input rate
+        cost += total_input * input_price / 1_000_000
+        # Output tokens at output rate
         cost += total_output * output_price / 1_000_000
-        # Cache reads at reduced rate
+        # Cache reads at reduced rate (0.1x input)
         cost += total_cache_read * cache_read_price / 1_000_000
+        # Cache writes at premium rate (1.25x input)
+        cost += total_cache_write * cache_write_price / 1_000_000
 
     # Calculate simple cost (without cache benefits - what it would cost without caching)
     simple_cost = 0.0
     if last_model in MODEL_PRICING:
-        input_price, output_price, _ = MODEL_PRICING[last_model]
+        input_price, output_price, _, _ = MODEL_PRICING[last_model]
         simple_cost = total_input * input_price / 1_000_000 + total_output * output_price / 1_000_000
 
     return {
@@ -384,7 +383,7 @@ def read_hook_input() -> dict:
             data = sys.stdin.read()
             if data.strip():
                 return json.loads(data)
-    except (json.JSONDecodeError, IOError):
+    except (json.JSONDecodeError, OSError):
         pass
     return {}
 
@@ -519,7 +518,7 @@ def run_daemon():
         try:
             rpc.clear()
             rpc.close()
-        except:
+        except Exception:
             pass
     log("Daemon stopped")
 
@@ -569,7 +568,6 @@ def cmd_start():
     log(f"Starting daemon for project: {project_name}")
 
     if sys.platform == "win32":
-        import subprocess
         # Use pythonw if available for windowless execution
         python_exe = sys.executable
         script_path = Path(__file__).resolve()
@@ -637,9 +635,8 @@ def cmd_stop():
     if pid:
         try:
             if sys.platform == "win32":
-                import subprocess
                 subprocess.run(["taskkill", "/F", "/PID", str(pid)],
-                             capture_output=True)
+                               capture_output=True)
             else:
                 os.kill(pid, signal.SIGTERM)
             log(f"Stopped daemon (PID {pid})")
