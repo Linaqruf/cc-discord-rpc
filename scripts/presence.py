@@ -25,6 +25,19 @@ else:
 STATE_FILE = DATA_DIR / "state.json"
 PID_FILE = DATA_DIR / "daemon.pid"
 LOG_FILE = DATA_DIR / "daemon.log"
+REFCOUNT_FILE = DATA_DIR / "refcount"
+
+# Claude Code directories
+CLAUDE_DIR = Path.home() / ".claude"
+PROJECTS_DIR = CLAUDE_DIR / "projects"
+
+# Model display names
+MODEL_DISPLAY = {
+    "claude-opus-4-5-20251101": "Opus 4.5",
+    "claude-sonnet-4-5-20241022": "Sonnet 4.5",
+    "claude-sonnet-4-20250514": "Sonnet 4",
+    "claude-haiku-4-5-20241022": "Haiku 4.5",
+}
 
 # Tool to display name mapping
 TOOL_DISPLAY = {
@@ -127,6 +140,80 @@ def get_git_branch(project_path: str) -> str:
     return ""
 
 
+def read_refcount() -> int:
+    """Read current session refcount."""
+    if REFCOUNT_FILE.exists():
+        try:
+            return int(REFCOUNT_FILE.read_text().strip())
+        except (ValueError, IOError):
+            pass
+    return 0
+
+
+def write_refcount(count: int):
+    """Write session refcount."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if count <= 0:
+        try:
+            REFCOUNT_FILE.unlink()
+        except IOError:
+            pass
+    else:
+        REFCOUNT_FILE.write_text(str(count))
+
+
+def get_model_from_jsonl() -> str:
+    """Get model name from most recent JSONL file."""
+    if not PROJECTS_DIR.exists():
+        return ""
+
+    # Find most recent .jsonl file
+    jsonl_files = []
+    for path in PROJECTS_DIR.rglob("*.jsonl"):
+        try:
+            jsonl_files.append((path, path.stat().st_mtime))
+        except IOError:
+            continue
+
+    if not jsonl_files:
+        return ""
+
+    # Sort by modification time, get most recent
+    jsonl_files.sort(key=lambda x: x[1], reverse=True)
+    recent_file = jsonl_files[0][0]
+
+    # Parse last assistant message with model
+    last_model = ""
+    try:
+        with open(recent_file, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    msg = json.loads(line)
+                    if msg.get("type") == "assistant":
+                        model = msg.get("message", {}).get("model", "")
+                        if model:
+                            last_model = model
+                except json.JSONDecodeError:
+                    continue
+    except IOError:
+        pass
+
+    return format_model_name(last_model)
+
+
+def format_model_name(model_id: str) -> str:
+    """Convert model ID to display name."""
+    if model_id in MODEL_DISPLAY:
+        return MODEL_DISPLAY[model_id]
+    if "opus" in model_id.lower():
+        return "Opus"
+    if "sonnet" in model_id.lower():
+        return "Sonnet"
+    if "haiku" in model_id.lower():
+        return "Haiku"
+    return ""
+
+
 def read_hook_input() -> dict:
     """Read JSON input from stdin (provided by Claude Code hooks)."""
     try:
@@ -200,6 +287,7 @@ def run_daemon():
             tool = state.get("tool", "")
             project = state.get("project", "Claude Code")
             git_branch = state.get("git_branch", "")
+            model = state.get("model", "")
             session_start = state.get("session_start", int(time.time()))
 
             activity = TOOL_DISPLAY.get(tool, "Working")
@@ -210,14 +298,20 @@ def run_daemon():
             else:
                 details = f"Working on: {project}"
 
+            # Build state line: "Activity | Model" or just "Activity"
+            if model:
+                state_line = f"{activity} | {model}"
+            else:
+                state_line = activity
+
             # Only update if something changed
-            current = {"details": details, "activity": activity}
+            current = {"details": details, "state_line": state_line}
             if current != last_sent:
-                log(f"Sending to Discord: {details} | {activity}")
+                log(f"Sending to Discord: {details} | {state_line}")
                 try:
                     rpc.update(
                         details=details,
-                        state=activity,
+                        state=state_line,
                         start=session_start,
                         large_image="claude",
                         large_text="Claude Code",
@@ -252,6 +346,10 @@ def cmd_start():
     project = hook_input.get("cwd", os.environ.get("CLAUDE_PROJECT_DIR", ""))
     project_name = Path(project).name if project else get_project_name()
 
+    # Increment refcount
+    refcount = read_refcount() + 1
+    write_refcount(refcount)
+
     # Update state
     state = read_state()
     now = int(time.time())
@@ -262,9 +360,12 @@ def cmd_start():
     state["project"] = project_name
     state["project_path"] = project
     state["git_branch"] = get_git_branch(project) if project else ""
+    state["model"] = get_model_from_jsonl()
     state["last_update"] = now
     state["tool"] = ""
     write_state(state)
+
+    log(f"Session started (active sessions: {refcount})")
 
     # Check if daemon is running
     if get_daemon_pid():
@@ -319,7 +420,15 @@ def cmd_update():
 
 def cmd_stop():
     """Handle 'stop' command - clear presence and stop daemon."""
-    log("Stop command received")
+    # Decrement refcount
+    refcount = read_refcount() - 1
+    write_refcount(refcount)
+
+    if refcount > 0:
+        log(f"Session ended (active sessions: {refcount})")
+        return  # Don't stop daemon, other sessions still active
+
+    log("Last session ended, stopping daemon")
 
     # Clear state
     write_state({})
@@ -345,14 +454,23 @@ def cmd_status():
     """Handle 'status' command - show current status."""
     pid = get_daemon_pid()
     state = read_state()
+    refcount = read_refcount()
 
     if pid:
         print(f"Daemon running (PID {pid})")
     else:
         print("Daemon not running")
 
+    print(f"Active sessions: {refcount}")
+
     if state:
         print(f"Project: {state.get('project', 'Unknown')}")
+        git_branch = state.get('git_branch', '')
+        if git_branch:
+            print(f"Branch: {git_branch}")
+        model = state.get('model', '')
+        if model:
+            print(f"Model: {model}")
         print(f"Last tool: {state.get('tool', 'None')}")
         last_update = state.get("last_update", 0)
         if last_update:
