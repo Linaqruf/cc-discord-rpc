@@ -692,7 +692,8 @@ def cmd_start():
     state = read_state()
     now = int(time.time())
 
-    if not state.get("session_start"):
+    # Reset session_start if this is the first/only session (timer starts fresh)
+    if session_count == 1:
         state["session_start"] = now
 
     state["project"] = project_name
