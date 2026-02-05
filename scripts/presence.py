@@ -4,6 +4,7 @@ Discord Rich Presence for Claude Code
 Manages Discord RPC connection and updates presence based on Claude Code activity.
 """
 
+import copy
 import sys
 import os
 import json
@@ -15,54 +16,40 @@ import signal
 from pathlib import Path
 from datetime import datetime
 
+# Shared state management (provides process-safe file locking)
+from state import (
+    DATA_DIR,
+    STATE_FILE,
+    StateLock,
+    read_state,
+    write_state,
+    update_state,
+    clear_state,
+    read_state_unlocked,
+    write_state_unlocked,
+    format_tokens,
+)
+
+# Optional YAML support for config file
+try:
+    import yaml
+    YAML_AVAILABLE = True
+except ImportError:
+    YAML_AVAILABLE = False
+
+# Track if YAML warning has been logged (always defined at module level)
+_yaml_warning_logged = False
+
 # Discord Application ID
 DISCORD_APP_ID = "1330919293709324449"
 
-# Data directory
-if sys.platform == "win32":
-    DATA_DIR = Path(os.environ.get("APPDATA", "")) / "cc-discord-rpc"
-else:
-    DATA_DIR = Path.home() / ".local" / "share" / "cc-discord-rpc"
-
-STATE_FILE = DATA_DIR / "state.json"
+# Data files (DATA_DIR imported from state module)
 PID_FILE = DATA_DIR / "daemon.pid"
 LOG_FILE = DATA_DIR / "daemon.log"
 SESSIONS_FILE = DATA_DIR / "sessions.json"  # Tracks active session PIDs
 
 # Orphan check interval (seconds) - how often daemon checks for dead sessions
 ORPHAN_CHECK_INTERVAL = 30
-
-# Claude Code directories
-CLAUDE_DIR = Path.home() / ".claude"
-PROJECTS_DIR = CLAUDE_DIR / "projects"
-
-# Model display names
-MODEL_DISPLAY = {
-    # Claude 4.5 series
-    "claude-opus-4-5-20251101": "Opus 4.5",
-    "claude-sonnet-4-5-20250514": "Sonnet 4.5",
-    "claude-sonnet-4-5-20241022": "Sonnet 4.5",
-    "claude-haiku-4-5-20250414": "Haiku 4.5",
-    "claude-haiku-4-5-20241022": "Haiku 4.5",
-    # Claude 4 series
-    "claude-opus-4-20250514": "Opus 4",
-    "claude-sonnet-4-20250514": "Sonnet 4",
-}
-
-# Model pricing per 1M tokens (input, output, cache_read, cache_write)
-# Cache reads at 0.1x input rate, cache writes at 1.25x input rate
-MODEL_PRICING = {
-    # Claude 4.5 series
-    "claude-opus-4-5-20251101": (5.00, 25.00, 0.50, 6.25),
-    "claude-sonnet-4-5-20250514": (3.00, 15.00, 0.30, 3.75),
-    "claude-haiku-4-5-20250414": (1.00, 5.00, 0.10, 1.25),
-    # Claude 4 series
-    "claude-opus-4-20250514": (15.00, 75.00, 1.50, 18.75),
-    "claude-sonnet-4-20250514": (3.00, 15.00, 0.30, 3.75),
-    # Legacy/fallback
-    "claude-sonnet-4-5-20241022": (3.00, 15.00, 0.30, 3.75),
-    "claude-haiku-4-5-20241022": (1.00, 5.00, 0.10, 1.25),
-}
 
 # Tool to display name mapping (keep short for Discord limit)
 TOOL_DISPLAY = {
@@ -90,38 +77,218 @@ TOOL_DISPLAY = {
     "mcp": "Using MCP",
 }
 
-# Idle timeout in seconds (5 minutes) - after this, show "Idling" instead of last activity
-IDLE_TIMEOUT = 5 * 60
+# Default idle timeout - used as fallback when config cannot be loaded
+IDLE_TIMEOUT = 5 * 60  # 5 minutes
+
+# Configuration
+CONFIG_FILE_NAME = "config.yaml"
+DEFAULT_CONFIG = {
+    "discord_app_id": None,  # Uses DISCORD_APP_ID constant if None
+    "display": {
+        "show_tokens": True,
+        "show_cost": True,
+        "show_model": True,
+        "show_branch": True,
+        "show_file": False,  # Disabled by default - requires parsing tool_input on each hook call
+    },
+    "idle_timeout": 300,  # 5 minutes in seconds
+}
+CONFIG_RELOAD_INTERVAL = 30  # Reload config every 30 seconds
+
+# Discord connection retry limit (12 retries * 5 seconds = 1 minute before giving up)
+DISCORD_CONNECT_MAX_RETRIES = 12
+
+# Tools that operate on files (for filename display)
+FILE_TOOLS = {"Edit", "Write", "Read", "NotebookEdit", "NotebookRead"}
+
+
+_log_to_file_failed = False
 
 
 def log(message: str):
-    """Append message to log file."""
+    """Append message to log file, with stderr fallback on failure."""
+    global _log_to_file_failed
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    formatted = f"[{timestamp}] {message}"
+
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(f"[{timestamp}] {message}\n")
-    except OSError:
-        pass  # Logging should never crash the daemon
-
-
-def read_state() -> dict:
-    """Read current state from state file."""
-    if STATE_FILE.exists():
-        try:
-            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            pass
-    return {}
-
-
-def write_state(state: dict):
-    """Write state to state file."""
-    try:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+            f.write(formatted + "\n")
+        return  # Success
     except OSError as e:
-        log(f"Warning: Could not write state: {e}")
+        # File logging failed - fall back to stderr
+        if not _log_to_file_failed:
+            _log_to_file_failed = True
+            print(f"[presence] Warning: Log file unavailable ({e}), falling back to stderr", file=sys.stderr)
+
+    # Fallback: write to stderr so diagnostics aren't completely lost
+    try:
+        print(f"[presence] {formatted}", file=sys.stderr)
+    except Exception:
+        pass  # Last resort - don't crash if even stderr fails
+
+
+def get_plugin_root() -> Path | None:
+    """Get plugin root directory from CLAUDE_PLUGIN_ROOT environment variable."""
+    plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT")
+    if plugin_root:
+        path = Path(plugin_root)
+        if path.exists():
+            return path
+    return None
+
+
+def load_config() -> dict:
+    """Load configuration from YAML file, falling back to defaults.
+
+    Config location: {CLAUDE_PLUGIN_ROOT}/.claude-plugin/config.yaml
+
+    Returns merged config with defaults for any missing keys.
+    """
+    global _yaml_warning_logged
+
+    config = DEFAULT_CONFIG.copy()
+    config["display"] = DEFAULT_CONFIG["display"].copy()
+
+    plugin_root = get_plugin_root()
+
+    # Warn if config.yaml exists but PyYAML is not installed
+    if not YAML_AVAILABLE:
+        if plugin_root:
+            config_path = plugin_root / ".claude-plugin" / CONFIG_FILE_NAME
+            if config_path.exists() and not _yaml_warning_logged:
+                log(f"Warning: PyYAML not installed - config.yaml is being IGNORED. Install with: pip install pyyaml")
+                _yaml_warning_logged = True
+        return config
+
+    if not plugin_root:
+        return config
+
+    config_path = plugin_root / ".claude-plugin" / CONFIG_FILE_NAME
+    if not config_path.exists():
+        return config
+
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            user_config = yaml.safe_load(f) or {}
+
+        # Merge discord_app_id (validate 17-19 digit numeric string)
+        if "discord_app_id" in user_config and user_config["discord_app_id"]:
+            app_id = str(user_config["discord_app_id"])
+            if app_id.isdigit() and 17 <= len(app_id) <= 19:
+                config["discord_app_id"] = app_id
+            else:
+                log(f"Warning: Invalid discord_app_id format '{app_id}', using default")
+
+        # Merge display toggles
+        if "display" in user_config and isinstance(user_config["display"], dict):
+            for key in config["display"]:
+                if key in user_config["display"]:
+                    config["display"][key] = bool(user_config["display"][key])
+
+        # Merge idle_timeout (1 second to 24 hours)
+        if "idle_timeout" in user_config:
+            timeout = user_config["idle_timeout"]
+            if isinstance(timeout, (int, float)) and 0 < timeout <= 86400:
+                config["idle_timeout"] = int(timeout)
+            else:
+                log(f"Warning: idle_timeout must be 1-86400 seconds, got '{timeout}', using default")
+
+        log(f"Loaded config from {config_path}")
+
+    except yaml.YAMLError as e:
+        log(f"Error parsing config YAML: {e}")
+    except OSError as e:
+        log(f"Error reading config file: {e}")
+
+    return config
+
+
+# Global config cache for daemon
+_config_cache = None
+_config_last_load = 0
+
+
+def get_config(force_reload: bool = False) -> dict:
+    """Get cached config, reloading periodically for hot-reload support.
+
+    Returns a deep copy of the cached config to prevent accidental mutation.
+    """
+    global _config_cache, _config_last_load
+
+    now = time.time()
+    if force_reload or _config_cache is None or (now - _config_last_load > CONFIG_RELOAD_INTERVAL):
+        _config_cache = load_config()
+        _config_last_load = now
+
+    return copy.deepcopy(_config_cache)
+
+
+def extract_file_from_tool_input(hook_input: dict) -> str:
+    """Extract filename from hook input's tool_input field.
+
+    For Edit/Write/Read tools, tool_input contains:
+    {
+        "file_path": "/path/to/file.py",
+        ...
+    }
+
+    For NotebookEdit/NotebookRead tools, tool_input contains:
+    {
+        "notebook_path": "/path/to/notebook.ipynb",
+        ...
+    }
+
+    Returns just the filename (not full path), or empty string if not available.
+    """
+    tool_name = hook_input.get("tool_name", "")
+    if tool_name not in FILE_TOOLS:
+        return ""
+
+    tool_input = hook_input.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return ""
+
+    # Check file_path (Edit/Write/Read) or notebook_path (NotebookEdit/NotebookRead)
+    file_path = tool_input.get("file_path", "") or tool_input.get("notebook_path", "")
+    if not file_path:
+        return ""
+
+    try:
+        return Path(file_path).name
+    except (ValueError, OSError, TypeError) as e:
+        log(f"Warning: Could not extract filename from '{file_path}': {e}")
+        return ""
+
+
+def truncate_filename(filename: str, max_length: int = 25) -> str:
+    """Truncate filename for Discord display limits.
+
+    If filename exceeds max_length, keeps the start and end of the stem with '...'
+    in the middle, preserving the file extension.
+
+    Example: 'very_long_component_name.tsx' (28 chars) -> 'very_long...t_name.tsx' (22 chars)
+    """
+    if len(filename) <= max_length:
+        return filename
+
+    stem = Path(filename).stem
+    suffix = Path(filename).suffix
+
+    # Calculate how much of stem we can keep
+    available = max_length - len(suffix) - 3  # 3 for '...'
+    if available < 5:
+        # Very long extension, just truncate from end
+        return filename[:max_length - 3] + "..."
+
+    # Keep start and end of stem
+    half = available // 2
+    return stem[:half] + "..." + stem[-half:] + suffix
+
+
+# Note: read_state, write_state, update_state, clear_state are imported from state module
+# which provides process-safe file locking to prevent race conditions
 
 
 def get_daemon_pid() -> int | None:
@@ -129,7 +296,8 @@ def get_daemon_pid() -> int | None:
     if not PID_FILE.exists():
         return None
     try:
-        pid = int(PID_FILE.read_text().strip())
+        pid_content = PID_FILE.read_text().strip()
+        pid = int(pid_content)
         # Check if process is actually running
         if sys.platform == "win32":
             result = subprocess.run(
@@ -141,8 +309,16 @@ def get_daemon_pid() -> int | None:
         else:
             os.kill(pid, 0)  # Doesn't kill, just checks
             return pid
-    except (ValueError, ProcessLookupError, PermissionError, OSError):
-        pass
+    except ValueError as e:
+        log(f"Warning: Corrupt PID file content '{pid_content}', removing: {e}")
+        try:
+            PID_FILE.unlink()
+        except OSError:
+            pass
+    except ProcessLookupError:
+        pass  # Process not running - normal case
+    except (PermissionError, OSError) as e:
+        log(f"Warning: Could not check daemon PID: {e}")
     return None
 
 
@@ -159,8 +335,10 @@ def remove_pid():
     """Remove PID file."""
     try:
         PID_FILE.unlink()
-    except OSError:
-        pass
+    except FileNotFoundError:
+        pass  # Already gone, no problem
+    except OSError as e:
+        log(f"Warning: Could not remove PID file: {e}")
 
 
 def get_project_name(project_path: str = "") -> str:
@@ -340,8 +518,8 @@ def read_sessions() -> dict:
     if SESSIONS_FILE.exists():
         try:
             return json.loads(SESSIONS_FILE.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            pass
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
+            log(f"Warning: Could not read sessions file: {e}")
     return {}
 
 
@@ -355,8 +533,10 @@ def write_sessions(sessions: dict):
     if not sessions:
         try:
             SESSIONS_FILE.unlink()
-        except OSError:
-            pass
+        except FileNotFoundError:
+            pass  # Already gone, no problem
+        except OSError as e:
+            log(f"Warning: Could not remove sessions file: {e}")
     else:
         try:
             SESSIONS_FILE.write_text(json.dumps(sessions), encoding="utf-8")
@@ -404,158 +584,6 @@ def cleanup_dead_sessions() -> int:
     return len(alive_sessions)
 
 
-def find_most_recent_jsonl() -> Path | None:
-    """Find the most recently modified JSONL file in PROJECTS_DIR."""
-    if not PROJECTS_DIR.exists():
-        return None
-
-    jsonl_files = []
-    for path in PROJECTS_DIR.rglob("*.jsonl"):
-        try:
-            jsonl_files.append((path, path.stat().st_mtime))
-        except OSError:
-            continue
-
-    if not jsonl_files:
-        return None
-
-    jsonl_files.sort(key=lambda x: x[1], reverse=True)
-    return jsonl_files[0][0]
-
-
-def get_model_from_jsonl() -> str:
-    """Get model name from most recent JSONL file."""
-    recent_file = find_most_recent_jsonl()
-    if not recent_file:
-        return ""
-
-    # Parse last assistant message with model
-    last_model = ""
-    try:
-        with open(recent_file, "r", encoding="utf-8") as f:
-            for line in f:
-                try:
-                    msg = json.loads(line)
-                    if msg.get("type") == "assistant":
-                        model = msg.get("message", {}).get("model", "")
-                        if model:
-                            last_model = model
-                except json.JSONDecodeError:
-                    continue
-    except OSError:
-        pass
-
-    return format_model_name(last_model)
-
-
-def format_model_name(model_id: str) -> str:
-    """Convert model ID to display name."""
-    if model_id in MODEL_DISPLAY:
-        return MODEL_DISPLAY[model_id]
-    if "opus" in model_id.lower():
-        return "Opus"
-    if "sonnet" in model_id.lower():
-        return "Sonnet"
-    if "haiku" in model_id.lower():
-        return "Haiku"
-    return ""
-
-
-def get_session_tokens_and_cost(session_id: str = "") -> dict:
-    """Get total tokens and cost from current session's JSONL file.
-
-    Returns: dict with input, output, cache_read, cache_write, cost, simple_cost
-    """
-    empty_result = {
-        "input": 0,
-        "output": 0,
-        "cache_read": 0,
-        "cache_write": 0,
-        "cost": 0.0,
-        "simple_cost": 0.0,
-    }
-
-    # Find JSONL file for current session or most recent
-    jsonl_file = None
-    if session_id and PROJECTS_DIR.exists():
-        # Try to find file matching session ID
-        for path in PROJECTS_DIR.rglob(f"{session_id}.jsonl"):
-            jsonl_file = path
-            break
-
-    if not jsonl_file:
-        jsonl_file = find_most_recent_jsonl()
-        if not jsonl_file:
-            return empty_result
-
-    # Parse all assistant messages and sum tokens
-    total_input = 0
-    total_output = 0
-    total_cache_read = 0
-    total_cache_write = 0
-    last_model = ""
-
-    try:
-        with open(jsonl_file, "r", encoding="utf-8") as f:
-            for line in f:
-                try:
-                    msg = json.loads(line)
-                    if msg.get("type") == "assistant":
-                        message = msg.get("message", {})
-                        model = message.get("model", "")
-                        if model:
-                            last_model = model
-
-                        usage = message.get("usage", {})
-                        total_input += usage.get("input_tokens", 0)
-                        total_output += usage.get("output_tokens", 0)
-                        total_cache_read += usage.get("cache_read_input_tokens", 0)
-                        total_cache_write += usage.get("cache_creation_input_tokens", 0)
-                except json.JSONDecodeError:
-                    continue
-    except OSError:
-        return empty_result
-
-    # Calculate cost
-    cost = 0.0
-    if last_model in MODEL_PRICING:
-        input_price, output_price, cache_read_price, cache_write_price = MODEL_PRICING[last_model]
-        # Input tokens at input rate
-        cost += total_input * input_price / 1_000_000
-        # Output tokens at output rate
-        cost += total_output * output_price / 1_000_000
-        # Cache reads at reduced rate (0.1x input)
-        cost += total_cache_read * cache_read_price / 1_000_000
-        # Cache writes at premium rate (1.25x input)
-        cost += total_cache_write * cache_write_price / 1_000_000
-    elif last_model:
-        log(f"Warning: Unknown model '{last_model}', cost calculation skipped")
-
-    # Calculate simple cost (without cache benefits - what it would cost without caching)
-    simple_cost = 0.0
-    if last_model in MODEL_PRICING:
-        input_price, output_price, _, _ = MODEL_PRICING[last_model]
-        simple_cost = total_input * input_price / 1_000_000 + total_output * output_price / 1_000_000
-
-    return {
-        "input": total_input,
-        "output": total_output,
-        "cache_read": total_cache_read,
-        "cache_write": total_cache_write,
-        "cost": cost,
-        "simple_cost": simple_cost,
-    }
-
-
-def format_tokens(count: int) -> str:
-    """Format token count for display (e.g., 12.5k, 1.2M)."""
-    if count >= 1_000_000:
-        return f"{count / 1_000_000:.1f}M"
-    elif count >= 1000:
-        return f"{count / 1000:.1f}k"
-    return str(count)
-
-
 def read_hook_input() -> dict:
     """Read JSON input from stdin (provided by Claude Code hooks)."""
     try:
@@ -563,8 +591,8 @@ def read_hook_input() -> dict:
             data = sys.stdin.read()
             if data.strip():
                 return json.loads(data)
-    except (json.JSONDecodeError, OSError):
-        pass
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
+        log(f"Warning: Could not parse hook input: {e}")
     return {}
 
 
@@ -575,6 +603,15 @@ def run_daemon():
     log("Daemon starting...")
     write_pid()
     atexit.register(remove_pid)
+
+    # Log YAML availability on startup for easier debugging
+    if not YAML_AVAILABLE:
+        log("Info: PyYAML not installed - config.yaml support disabled. Install with: pip install pyyaml")
+
+    # Load initial config
+    config = get_config(force_reload=True)
+    app_id = config.get("discord_app_id") or DISCORD_APP_ID
+    log(f"Using Discord App ID: {app_id}")
 
     # Handle graceful shutdown
     def shutdown(signum, frame):
@@ -588,11 +625,32 @@ def run_daemon():
     # Connect to Discord
     rpc = None
     connected = False
+    current_app_id = app_id
     last_sent = {}  # Track last sent state to avoid redundant updates
     last_orphan_check = 0  # Track when we last checked for dead sessions
+    discord_connect_attempts = 0  # Track connection retry attempts
+    consecutive_errors = 0  # Track consecutive loop errors for circuit breaker
+    MAX_CONSECUTIVE_ERRORS = 10  # Exit after this many consecutive failures
 
     while True:
         try:
+            # Periodically reload config for hot-reload support
+            config = get_config()
+            new_app_id = config.get("discord_app_id") or DISCORD_APP_ID
+
+            # Check if app ID changed - need to reconnect
+            if new_app_id != current_app_id and connected:
+                log(f"App ID changed from {current_app_id} to {new_app_id}, reconnecting...")
+                try:
+                    rpc.clear()
+                    rpc.close()
+                except (ConnectionError, ConnectionResetError, BrokenPipeError,
+                        TimeoutError, OSError) as e:
+                    log(f"Warning: Error during RPC disconnect before reconnect: {e}")
+                connected = False
+                rpc = None
+                current_app_id = new_app_id
+
             # Periodically check for dead sessions (orphan cleanup)
             now = time.time()
             if now - last_orphan_check > ORPHAN_CHECK_INTERVAL:
@@ -604,35 +662,57 @@ def run_daemon():
 
             # Try to connect if not connected
             if not connected:
+                discord_connect_attempts += 1
+                if discord_connect_attempts > DISCORD_CONNECT_MAX_RETRIES:
+                    log(f"ERROR: Cannot connect to Discord after {DISCORD_CONNECT_MAX_RETRIES} attempts. Is Discord running?")
+                    break
                 try:
-                    rpc = Presence(DISCORD_APP_ID)
+                    rpc = Presence(current_app_id)
                     rpc.connect()
                     connected = True
-                    log("Connected to Discord")
-                except Exception as e:
-                    log(f"Failed to connect to Discord: {e}")
+                    discord_connect_attempts = 0  # Reset on successful connection
+                    log(f"Connected to Discord with App ID: {current_app_id}")
+                except (ConnectionError, ConnectionRefusedError, ConnectionResetError,
+                        BrokenPipeError, TimeoutError, OSError) as e:
+                    # Expected connection failures - retry
+                    log(f"Failed to connect to Discord (attempt {discord_connect_attempts}/{DISCORD_CONNECT_MAX_RETRIES}): {e}")
                     time.sleep(5)
                     continue
+                except Exception as e:
+                    # Unexpected error (likely a bug) - fail fast with traceback
+                    import traceback
+                    log(f"FATAL: Unexpected error connecting to Discord: {e}\n{traceback.format_exc()}")
+                    break
 
-            # Read current state
-            state = read_state()
+            # Read current state (pass logger for error visibility)
+            state = read_state(log)
 
             if not state:
                 time.sleep(1)
                 continue
 
+            # Get display settings from config
+            display_cfg = config.get("display", {})
+            show_tokens = display_cfg.get("show_tokens", True)
+            show_cost = display_cfg.get("show_cost", True)
+            show_model = display_cfg.get("show_model", True)
+            show_branch = display_cfg.get("show_branch", True)
+            show_file = display_cfg.get("show_file", False)
+
             # Check for idle timeout - show "Idling" instead of clearing
             last_update = state.get("last_update", 0)
-            is_idle = time.time() - last_update > IDLE_TIMEOUT
+            idle_timeout = config.get("idle_timeout", IDLE_TIMEOUT)
+            is_idle = time.time() - last_update > idle_timeout
 
-            # Update presence
+            # Get state values
             tool = state.get("tool", "")
             project = state.get("project", "Claude Code")
-            git_branch = state.get("git_branch", "")
-            model = state.get("model", "")
+            git_branch = state.get("git_branch", "") if show_branch else ""
+            model = state.get("model", "") if show_model else ""
+            current_file = state.get("file", "") if show_file else ""
             session_start = state.get("session_start", int(time.time()))
 
-            # Get token data
+            # Get token data (only if needed for display)
             tokens = state.get("tokens", {})
             input_tokens = tokens.get("input", 0)
             output_tokens = tokens.get("output", 0)
@@ -651,31 +731,58 @@ def run_daemon():
             else:
                 activity = "Working"
 
-            # Build details line: "Activity on project (branch)"
-            if git_branch:
-                details = f"{activity} on {project} ({git_branch})"
+            # Only show file for non-idle file operations
+            display_file = current_file if not is_idle and tool in FILE_TOOLS else ""
+
+            # Build activity string with optional filename
+            if display_file:  # show_file already checked when setting display_file
+                truncated_file = truncate_filename(display_file)
+                activity_str = f"{activity} {truncated_file}"
             else:
-                details = f"{activity} on {project}"
+                activity_str = activity
 
-            # Cycle state line every 8s: 5s simple, 3s cached
+            # Build details line: "Activity [file] on project [(branch)]"
+            if git_branch:
+                details = f"{activity_str} on {project} ({git_branch})"
+            else:
+                details = f"{activity_str} on {project}"
+
+            # Truncate details if too long for Discord (max ~128 chars)
+            if len(details) > 120:
+                if git_branch:
+                    details = f"{activity_str} on {project}"
+                if len(details) > 120:
+                    max_proj = 120 - len(activity_str) - 4
+                    details = f"{activity_str} on {project[:max(10, max_proj)]}..."
+
+            # Cycle display between two views every 8 seconds:
+            # - Simple (5s): input + output tokens, cost without cache consideration
+            # - Cached (3s): total tokens including cache reads/writes
             cycle_pos = int(time.time()) % 8
-            show_simple = cycle_pos < 5  # 0-4 = simple (5s), 5-7 = cached (3s)
+            show_simple = cycle_pos < 5
 
-            # Simple = input + output only
             simple_tokens = input_tokens + output_tokens
-            # Cached = total including cache
             cached_tokens = input_tokens + output_tokens + cache_read + cache_write
 
-            if show_simple:
-                # Simple view: input/output tokens only
-                tokens_display = format_tokens(simple_tokens)
-                cost_display = f"${simple_cost:.2f}"
-                state_line = f"{model} • {tokens_display} tokens • {cost_display}" if model else f"{tokens_display} tokens • {cost_display}"
-            else:
-                # Cached view: total with cache
-                tokens_display = format_tokens(cached_tokens)
-                cost_display = f"${cost:.2f}"
-                state_line = f"{model} • {tokens_display} cached • {cost_display}" if model else f"{tokens_display} cached • {cost_display}"
+            # Build state line with config toggles
+            parts = []
+
+            if show_model and model:
+                parts.append(model)
+
+            if show_tokens:
+                if show_simple:
+                    parts.append(f"{format_tokens(simple_tokens)} tokens")
+                else:
+                    parts.append(f"{format_tokens(cached_tokens)} cached")
+
+            if show_cost:
+                if show_simple:
+                    parts.append(f"${simple_cost:.2f}")
+                else:
+                    parts.append(f"${cost:.2f}")
+
+            state_line = " \u2022 ".join(parts) if parts else "Claude Code"
 
             # Only update if something changed (check every cycle)
             current = {"details": details, "state_line": state_line}
@@ -690,26 +797,49 @@ def run_daemon():
                         large_text="Claude Code",
                     )
                     last_sent = current
-                except Exception as e:
-                    log(f"Failed to update presence: {e}")
+                except (ConnectionError, ConnectionResetError, BrokenPipeError,
+                        TimeoutError, OSError) as e:
+                    # Connection lost - will reconnect on next iteration
+                    log(f"Failed to update presence (connection lost): {e}")
                     connected = False
                     rpc = None
+                except Exception as e:
+                    # Unexpected error (likely a bug in payload construction)
+                    import traceback
+                    log(f"Failed to update presence (unexpected): {e}\n{traceback.format_exc()}")
+                    # Don't disconnect - this might be a transient data issue
+                    # Continue to next iteration to try again with fresh state
 
             time.sleep(1)
 
         except KeyboardInterrupt:
             break
-        except Exception as e:
-            log(f"Daemon error: {e}")
+        except SystemExit:
+            raise  # Allow intentional exits to propagate
+        except (OSError, IOError, ConnectionError, BrokenPipeError) as e:
+            # Expected transient errors - log and continue with circuit breaker
+            consecutive_errors += 1
+            log(f"Daemon error (recoverable, {consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}): {e}")
+            if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                log(f"ERROR: Too many consecutive errors ({consecutive_errors}), daemon exiting")
+                break
             time.sleep(5)
+        except Exception as e:
+            # Unexpected errors (programming bugs) - log and exit to avoid infinite loop
+            import traceback
+            log(f"Daemon error (FATAL unexpected): {e}\n{traceback.format_exc()}")
+            break  # Exit on programming errors rather than infinite retry loop
+        else:
+            # Reset error counter on successful iteration
+            consecutive_errors = 0
 
     # Cleanup
     if rpc:
         try:
             rpc.clear()
             rpc.close()
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"Warning: Error during RPC cleanup on shutdown: {e}")
     log("Daemon stopped")
 
 
@@ -723,30 +853,31 @@ def cmd_start():
     claude_pid = get_session_pid()
     session_count = add_session(claude_pid)
 
-    # Update state
-    state = read_state()
+    # Update state with file locking to prevent race conditions
     now = int(time.time())
-
-    # Reset session_start if this is the first/only session (timer starts fresh)
-    if session_count == 1:
-        state["session_start"] = now
-
-    state["project"] = project_name
-    state["project_path"] = project
-    state["git_branch"] = get_git_branch(project) if project else ""
-    state["model"] = get_model_from_jsonl()
-    state["last_update"] = now
-    state["tool"] = ""
-
-    # Get session ID from hook input if available
+    git_branch = get_git_branch(project) if project else ""
     session_id = hook_input.get("session_id", "")
-    state["session_id"] = session_id
 
-    # Initialize token tracking
-    tokens = get_session_tokens_and_cost(session_id)
-    state["tokens"] = tokens
+    try:
+        with StateLock():
+            state = read_state_unlocked()
 
-    write_state(state)
+            # Reset session_start if this is the first/only session (timer starts fresh)
+            if session_count == 1:
+                state["session_start"] = now
+
+            state["project"] = project_name
+            state["project_path"] = project
+            state["git_branch"] = git_branch
+            state["last_update"] = now
+            state["tool"] = ""
+            state["session_id"] = session_id
+            # Note: model and tokens are populated by statusline.py
+
+            write_state_unlocked(state)
+    except (OSError, TimeoutError) as e:
+        log(f"Warning: Could not write session state: {e}")
+        print(f"[presence] Warning: Could not write session state: {e}", file=sys.stderr)
 
     log(f"Session started for PID {claude_pid} (active sessions: {session_count})")
 
@@ -799,22 +930,37 @@ def cmd_update():
     hook_input = read_hook_input()
     tool_name = hook_input.get("tool_name", "")
 
-    state = read_state()
-    if not state:
-        # No active session, ignore
+    # Extract filename outside lock to minimize lock time
+    config = get_config()
+    show_file = config.get("display", {}).get("show_file", False)
+    filename = ""
+    if show_file:
+        filename = extract_file_from_tool_input(hook_input)
+
+    # Update state with file locking to prevent race conditions
+    try:
+        with StateLock():
+            state = read_state_unlocked()
+            if not state:
+                # No active session, ignore
+                return
+
+            state["tool"] = tool_name
+            state["last_update"] = int(time.time())
+
+            if show_file:
+                if filename:
+                    state["file"] = filename
+                elif tool_name not in FILE_TOOLS:
+                    state["file"] = ""
+
+            # Note: tokens are updated by statusline.py (no JSONL parsing needed)
+            write_state_unlocked(state)
+    except (OSError, TimeoutError) as e:
+        log(f"Warning: Could not update session state: {e}")
         return
 
-    state["tool"] = tool_name
-    state["last_update"] = int(time.time())
-
-    # Refresh token counts
-    session_id = state.get("session_id", "")
-    tokens = get_session_tokens_and_cost(session_id)
-    state["tokens"] = tokens
-
-    write_state(state)
-
-    log(f"Updated activity: {tool_name}")
+    log(f"Updated: {tool_name}" + (f" ({filename})" if filename else ""))
 
 
 def cmd_stop():
@@ -829,8 +975,8 @@ def cmd_stop():
 
     log("Last session ended, stopping daemon")
 
-    # Clear state
-    write_state({})
+    # Clear state (with locking)
+    clear_state(log)
 
     # Kill daemon if running
     pid = get_daemon_pid()
@@ -842,7 +988,7 @@ def cmd_stop():
             else:
                 os.kill(pid, signal.SIGTERM)
             log(f"Stopped daemon (PID {pid})")
-        except Exception as e:
+        except (OSError, subprocess.SubprocessError) as e:
             log(f"Failed to stop daemon: {e}")
 
     remove_pid()
