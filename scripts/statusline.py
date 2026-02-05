@@ -26,8 +26,9 @@ from state import StateLock, read_state_unlocked, write_state_unlocked
 if sys.platform == "win32":
     try:
         sys.stdout.reconfigure(encoding='utf-8')
-    except (AttributeError, OSError):
-        pass  # Fall back to default encoding
+    except (AttributeError, OSError) as e:
+        # Warn user about potential garbled output
+        print(f"[statusline] Warning: UTF-8 encoding unavailable ({e}), output may be garbled", file=sys.stderr)
 
 # ═══════════════════════════════════════════════════════════════
 # Apple System Colors (ANSI approximations)

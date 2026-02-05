@@ -100,15 +100,31 @@ DISCORD_CONNECT_MAX_RETRIES = 12
 FILE_TOOLS = {"Edit", "Write", "Read", "NotebookEdit", "NotebookRead"}
 
 
+_log_to_file_failed = False
+
+
 def log(message: str):
-    """Append message to log file."""
+    """Append message to log file, with stderr fallback on failure."""
+    global _log_to_file_failed
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    formatted = f"[{timestamp}] {message}"
+
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(f"[{timestamp}] {message}\n")
-    except OSError:
-        pass  # Logging should never crash the daemon
+            f.write(formatted + "\n")
+        return  # Success
+    except OSError as e:
+        # File logging failed - fall back to stderr
+        if not _log_to_file_failed:
+            _log_to_file_failed = True
+            print(f"[presence] Warning: Log file unavailable ({e}), falling back to stderr", file=sys.stderr)
+
+    # Fallback: write to stderr so diagnostics aren't completely lost
+    try:
+        print(f"[presence] {formatted}", file=sys.stderr)
+    except Exception:
+        pass  # Last resort - don't crash if even stderr fails
 
 
 def get_plugin_root() -> Path | None:
@@ -658,10 +674,17 @@ def run_daemon():
                     connected = True
                     discord_connect_attempts = 0  # Reset on successful connection
                     log(f"Connected to Discord with App ID: {current_app_id}")
-                except Exception as e:
+                except (ConnectionError, ConnectionRefusedError, ConnectionResetError,
+                        BrokenPipeError, TimeoutError, OSError) as e:
+                    # Expected connection failures - retry
                     log(f"Failed to connect to Discord (attempt {discord_connect_attempts}/{DISCORD_CONNECT_MAX_RETRIES}): {e}")
                     time.sleep(5)
                     continue
+                except Exception as e:
+                    # Unexpected error (likely a bug) - fail fast with traceback
+                    import traceback
+                    log(f"FATAL: Unexpected error connecting to Discord: {e}\n{traceback.format_exc()}")
+                    break
 
             # Read current state
             state = read_state()
@@ -777,10 +800,18 @@ def run_daemon():
                         large_text="Claude Code",
                     )
                     last_sent = current
-                except Exception as e:
-                    log(f"Failed to update presence: {e}")
+                except (ConnectionError, ConnectionResetError, BrokenPipeError,
+                        TimeoutError, OSError) as e:
+                    # Connection lost - will reconnect on next iteration
+                    log(f"Failed to update presence (connection lost): {e}")
                     connected = False
                     rpc = None
+                except Exception as e:
+                    # Unexpected error (likely a bug in payload construction)
+                    import traceback
+                    log(f"Failed to update presence (unexpected): {e}\n{traceback.format_exc()}")
+                    # Don't disconnect - this might be a transient data issue
+                    # Continue to next iteration to try again with fresh state
 
             time.sleep(1)
 
@@ -830,22 +861,26 @@ def cmd_start():
     git_branch = get_git_branch(project) if project else ""
     session_id = hook_input.get("session_id", "")
 
-    with StateLock():
-        state = read_state_unlocked()
+    try:
+        with StateLock():
+            state = read_state_unlocked()
 
-        # Reset session_start if this is the first/only session (timer starts fresh)
-        if session_count == 1:
-            state["session_start"] = now
+            # Reset session_start if this is the first/only session (timer starts fresh)
+            if session_count == 1:
+                state["session_start"] = now
 
-        state["project"] = project_name
-        state["project_path"] = project
-        state["git_branch"] = git_branch
-        state["last_update"] = now
-        state["tool"] = ""
-        state["session_id"] = session_id
-        # Note: model and tokens are populated by statusline.py
+            state["project"] = project_name
+            state["project_path"] = project
+            state["git_branch"] = git_branch
+            state["last_update"] = now
+            state["tool"] = ""
+            state["session_id"] = session_id
+            # Note: model and tokens are populated by statusline.py
 
-        write_state_unlocked(state)
+            write_state_unlocked(state)
+    except (OSError, TimeoutError) as e:
+        log(f"Warning: Could not write session state: {e}")
+        print(f"[presence] Warning: Could not write session state: {e}", file=sys.stderr)
 
     log(f"Session started for PID {claude_pid} (active sessions: {session_count})")
 

@@ -42,9 +42,12 @@ class StateLock:
 
     Usage:
         with StateLock():
-            state = read_state()
+            state = read_state_unlocked()
             state["key"] = "value"
-            write_state(state)
+            write_state_unlocked(state)
+
+    Note: Use the _unlocked variants inside StateLock context.
+    The locking variants (read_state, write_state) acquire their own locks.
     """
 
     def __init__(self, timeout: float = 5.0):
@@ -90,8 +93,9 @@ class StateLock:
                     msvcrt.locking(self._lock_fd, msvcrt.LK_UNLCK, 1)
                 else:
                     fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
-            except (OSError, IOError):
-                pass
+            except (OSError, IOError) as e:
+                # Log unlock failures - can cause future lock timeouts
+                print(f"[state] Warning: Failed to unlock state file: {e}", file=sys.stderr)
             finally:
                 try:
                     os.close(self._lock_fd)
@@ -109,12 +113,17 @@ def read_state_unlocked() -> dict:
     """
     Read current state from state file without locking.
     Use read_state() or wrap with StateLock for safe access.
+
+    Returns empty dict if file doesn't exist or is corrupt.
+    Logs to stderr on corruption since this is a low-level function
+    that may be called before presence.py logging is available.
     """
     if STATE_FILE.exists():
         try:
             return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
-            pass
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
+            # Log corruption to stderr - this is critical for debugging
+            print(f"[state] Warning: State file corrupt or unreadable: {e}", file=sys.stderr)
     return {}
 
 
@@ -166,20 +175,25 @@ def read_state(logger=None) -> dict:
         return {}
 
 
-def write_state(state: dict, logger=None):
+def write_state(state: dict, logger=None) -> bool:
     """
     Write state to state file with locking.
 
     Args:
         state: State dict to write
         logger: Optional logging function for warnings
+
+    Returns:
+        True if write succeeded, False on error
     """
     try:
         with StateLock():
             write_state_unlocked(state)
+        return True
     except (OSError, TimeoutError) as e:
         if logger:
             logger(f"Warning: Could not write state: {e}")
+        return False
 
 
 def update_state(updates: dict, logger=None) -> dict:
