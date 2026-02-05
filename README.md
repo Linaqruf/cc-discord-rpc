@@ -54,6 +54,28 @@ The status line cycles every 8 seconds:
 
 3. Restart Claude Code
 
+## Statusline Setup (Required)
+
+The plugin requires Claude Code's statusline feature for token/cost data.
+
+Add to `~/.claude/settings.json`:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "python /path/to/cc-discord-rpc/scripts/statusline.py"
+  }
+}
+```
+
+Replace `/path/to/cc-discord-rpc` with your actual plugin path.
+
+**Bonus**: This also displays an Apple Finder-style status bar in Claude Code:
+```
+Opus 4.5  ›  ████░░░░░░ 42%  ›  29.4k tokens  ›  $0.18  ›  main
+```
+
 ## Configuration
 
 Edit `.claude-plugin/config.yaml` to customize the plugin:
@@ -72,31 +94,9 @@ display:
 
 # Idle timeout in seconds (default: 300 = 5 minutes)
 idle_timeout: 300
-
-# Data source: "statusline" (recommended) or "jsonl" (legacy)
-data_source: statusline
 ```
 
 Config changes are hot-reloaded every 30 seconds.
-
-## Statusline Setup (Recommended)
-
-For best performance, set up the statusline integration to get token/cost data without JSONL parsing overhead.
-
-Add to `~/.claude/settings.json`:
-
-```json
-{
-  "statusLine": {
-    "type": "command",
-    "command": "python /path/to/cc-discord-rpc/scripts/statusline.py"
-  }
-}
-```
-
-Replace `/path/to/cc-discord-rpc` with your actual plugin path.
-
-**Bonus**: This also adds a status line to Claude Code showing `[Model] tokens | $cost`.
 
 ## Custom Discord App
 
@@ -129,11 +129,12 @@ To use your own Discord application (for custom branding):
       └─────────────────────────────────┘
 ```
 
-| Hook | Trigger | Action |
-|------|---------|--------|
-| SessionStart | Claude Code opens | Start daemon, increment session count |
-| PreToolUse | Before Edit/Bash/etc | Update activity and tokens |
-| SessionEnd | Claude Code exits | Decrement count, stop if last session |
+| Component | Trigger | Action |
+|-----------|---------|--------|
+| SessionStart hook | Claude Code opens | Start daemon, set project/branch |
+| PreToolUse hook | Before Edit/Bash/etc | Update current activity |
+| Statusline | Every ~300ms | Update model/tokens/cost |
+| SessionEnd hook | Claude Code exits | Stop daemon if last session |
 
 ## Manual Control
 
@@ -155,17 +156,12 @@ python scripts/presence.py status
 python scripts/presence.py stop
 ```
 
-## Model Pricing
+## Token & Cost Data
 
-Costs are calculated using official Anthropic API pricing:
-
-| Model | Input | Output | Cache Read | Cache Write |
-|-------|-------|--------|------------|-------------|
-| Opus 4.5 | $5/M | $25/M | $0.50/M | $6.25/M |
-| Sonnet 4.5 | $3/M | $15/M | $0.30/M | $3.75/M |
-| Sonnet 4 | $3/M | $15/M | $0.30/M | $3.75/M |
-| Haiku 4.5 | $1/M | $5/M | $0.10/M | $1.25/M |
-| Opus 4 | $15/M | $75/M | $1.50/M | $18.75/M |
+Token counts and costs are provided by Claude Code's statusline feature, which reports:
+- Total input/output tokens
+- Cache read/write tokens
+- Pre-calculated cost (using Anthropic's official pricing)
 
 ## Data Files
 
@@ -184,6 +180,11 @@ Location: `%APPDATA%/cc-discord-rpc/` (Windows) or `~/.local/share/cc-discord-rp
 - Make sure Discord desktop app is running
 - Check if pypresence is installed: `pip show pypresence`
 - Check logs: `%APPDATA%/cc-discord-rpc/daemon.log`
+
+**No tokens/cost displayed:**
+- Statusline setup is required - see "Statusline Setup" section
+- Verify `~/.claude/settings.json` has the statusLine config
+- Restart Claude Code after adding statusline config
 
 **"Could not connect" errors:**
 - Discord must be running before Claude Code starts
